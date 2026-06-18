@@ -1,3 +1,4 @@
+mod keychain;
 mod secret;
 mod totp;
 
@@ -10,12 +11,14 @@ use anyhow::{bail, Context, Result};
 fn print_usage(name: &str) {
     eprintln!(
         "usage:\n\
-         \t{name} <otp_secret.json>\n\
-         \t{name} --secret <base32_secret>\n\
-         \t{name} --json <otp_secret.json>\n\
+         \t{name}                         print current OTP (from macOS Keychain)\n\
+         \t{name} --json                  JSON output: {{\"code\":\"...\",\"expires_in\":N}}\n\
+         \t{name} import <otp_secret.json> store secret in macOS Keychain\n\
+         \t{name} --file <otp_secret.json> read secret from file instead of Keychain\n\
+         \t{name} --secret <base32_secret> use inline secret (debug only)\n\
          \n\
-         Reads the secret file exported by: corplink-rs otp fetch <config.json>\n\
-         Default file: $CORPLINK_OTP_SECRET_FILE or ./corplink_otp_secret.json"
+         Keychain: service=corplink-rs-otp, account=corplink \
+         (override account via $CORPLINK_OTP_ACCOUNT)"
     );
 }
 
@@ -28,19 +31,43 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    use keychain::{KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
+
     let name = env::args().next().unwrap_or_else(|| "corplink-otp".to_string());
     let mut args: Vec<String> = env::args().skip(1).collect();
 
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
-        print_usage(&name);
-        return Ok(());
+    if args.is_empty() {
+        return print_otp(false, None, None).await;
+    }
+
+    match args[0].as_str() {
+        "-h" | "--help" => {
+            print_usage(&name);
+            return Ok(());
+        }
+        "import" => {
+            args.remove(0);
+            let path = args
+                .first()
+                .context("usage: corplink-otp import <otp_secret.json>")?;
+            let path = PathBuf::from(path);
+            let store = secret::load(&path).await?;
+            let label = store
+                .username
+                .as_deref()
+                .map(|u| format!("CorpLink OTP ({u})"));
+            keychain::import_secret(&store.secret, label.as_deref())?;
+            eprintln!(
+                "stored TOTP secret in Keychain (service: {KEYCHAIN_SERVICE}, account: {KEYCHAIN_ACCOUNT})"
+            );
+            return Ok(());
+        }
+        _ => {}
     }
 
     let mut json_output = false;
     let mut secret_inline: Option<String> = None;
-    let mut secret_file = env::var("CORPLINK_OTP_SECRET_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("corplink_otp_secret.json"));
+    let mut secret_file: Option<PathBuf> = None;
 
     while let Some(arg) = args.first().cloned() {
         match arg.as_str() {
@@ -57,6 +84,15 @@ async fn run() -> Result<()> {
                 );
                 args.remove(0);
             }
+            "--file" => {
+                args.remove(0);
+                secret_file = Some(
+                    args.first()
+                        .context("missing value for --file")?
+                        .into(),
+                );
+                args.remove(0);
+            }
             "-h" | "--help" => {
                 print_usage(&name);
                 return Ok(());
@@ -65,18 +101,30 @@ async fn run() -> Result<()> {
                 bail!("unknown flag: {other}");
             }
             path => {
-                secret_file = PathBuf::from(path);
+                secret_file = Some(PathBuf::from(path));
                 args.remove(0);
             }
         }
     }
 
-    let secret_b32 = match secret_inline {
-        Some(secret) => secret,
-        None => {
-            let store = secret::load(&secret_file).await?;
-            store.secret
-        }
+    print_otp(json_output, secret_inline, secret_file).await
+}
+
+async fn print_otp(
+    json_output: bool,
+    secret_inline: Option<String>,
+    secret_file: Option<PathBuf>,
+) -> Result<()> {
+    let secret_b32 = if let Some(secret) = secret_inline {
+        secret
+    } else if let Some(path) = secret_file {
+        secret::load(&path).await?.secret
+    } else if let Ok(path) = env::var("CORPLINK_OTP_SECRET_FILE") {
+        secret::load(PathBuf::from(path).as_path())
+            .await?
+            .secret
+    } else {
+        keychain::load_secret()?
     };
 
     let (code, secs_left) = totp::generate_code(&secret_b32)?;
