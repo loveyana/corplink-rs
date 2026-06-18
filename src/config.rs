@@ -1,9 +1,11 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::otp_secret::{self, OtpSecretStore};
 use crate::state::State;
 use crate::utils;
 
@@ -16,6 +18,8 @@ pub const PLATFORM_CORPLINK: &str = "feilian";
 // password), as served by the newer feilian backend. opt-in via config.
 pub const PLATFORM_CORPLINK_V1: &str = "feilian_v1";
 pub const PLATFORM_OIDC: &str = "OIDC";
+// ByteDance internal SSO (same TPS QR flow as lark/OIDC)
+pub const PLATFORM_BYTEDANCE_SSO: &str = "bytedance_sso";
 // aka feishu
 pub const PLATFORM_LARK: &str = "lark";
 #[allow(dead_code)]
@@ -55,7 +59,11 @@ pub struct Config {
     pub username: String,
     pub password: Option<String>,
     pub platform: Option<String>,
+    /// Base32 TOTP secret (legacy field name). Prefer the dedicated otp secret file.
     pub code: Option<String>,
+    /// Optional path for the exported TOTP secret JSON file. Defaults to
+    /// `{interface_name}_otp_secret.json` next to the config file.
+    pub otp_secret_file: Option<String>,
     pub device_name: Option<String>,
     pub device_id: Option<String>,
     pub public_key: Option<String>,
@@ -168,6 +176,31 @@ impl Config {
             .await
             .with_context(|| format!("failed to write config file {file}"))?;
         Ok(())
+    }
+
+    pub fn otp_secret_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.otp_secret_file {
+            return Ok(PathBuf::from(path));
+        }
+        let conf_file = self
+            .conf_file
+            .as_ref()
+            .context("config file path missing")?;
+        let interface_name = self
+            .interface_name
+            .as_ref()
+            .context("interface name missing in config")?;
+        Ok(otp_secret::default_secret_path(
+            Path::new(conf_file),
+            interface_name,
+        ))
+    }
+
+    pub async fn save_otp_secret_file(&self, secret: &str) -> Result<PathBuf> {
+        let path = self.otp_secret_path()?;
+        let store = OtpSecretStore::new(secret, Some(self.username.clone()));
+        otp_secret::save(&path, &store).await?;
+        Ok(path)
     }
 }
 

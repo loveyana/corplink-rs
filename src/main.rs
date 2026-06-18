@@ -1,58 +1,53 @@
-mod api;
-mod client;
-mod config;
-mod dns;
-mod qrcode;
-mod resp;
-mod state;
-mod template;
-mod totp;
-mod utils;
-mod wg;
+use std::env;
+use std::process::exit;
+
+use anyhow::{Context, Result};
+
+use corplink_rs::client::Client;
+use corplink_rs::config::Config;
 
 #[cfg(windows)]
 use is_elevated;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use dns::DNSManager;
+use corplink_rs::dns::DNSManager;
 
-use std::env;
-use std::process::exit;
+use corplink_rs::config::WgConf;
+use corplink_rs::wg;
 
-use anyhow::{anyhow, Context, Result};
-
-use client::Client;
-use config::{Config, WgConf};
-
-fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
-    exit(1);
+enum Command {
+    Connect(String),
+    OtpFetch(String),
 }
 
-fn parse_arg() -> String {
-    let mut conf_file = String::from("config.json");
-    let mut args = env::args();
-    // pop name
-    let name = args.next().unwrap();
+fn print_usage_and_exit(name: &str) -> ! {
+    eprintln!(
+        "usage:\n\
+         \t{name} <config.json>              connect vpn (default config: config.json)\n\
+         \t{name} otp fetch <config.json>     login and export TOTP secret only\n\
+         \t{name} -h | --help"
+    );
+    exit(1)
+}
+
+fn parse_args() -> Command {
+    let mut args: Vec<String> = env::args().collect();
+    let name = args.first().cloned().unwrap_or_else(|| "corplink-rs".to_string());
+    args.remove(0);
+
     match args.len() {
-        0 => {}
-        1 => {
-            // pop arg
-            let arg = args.next().unwrap();
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage_and_exit(&name, &conf_file);
-                }
-                _ => {
-                    conf_file = arg;
-                }
-            }
-        }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
-        }
+        0 => Command::Connect("config.json".to_string()),
+        1 => match args[0].as_str() {
+            "-h" | "--help" => print_usage_and_exit(&name),
+            path => Command::Connect(path.to_string()),
+        },
+        2 if args[0] == "otp" && args[1] == "fetch" => print_usage_and_exit(&name),
+        3 if args[0] == "otp" && args[1] == "fetch" => match args[2].as_str() {
+            "-h" | "--help" => print_usage_and_exit(&name),
+            path => Command::OtpFetch(path.to_string()),
+        },
+        _ => print_usage_and_exit(&name),
     }
-    conf_file
 }
 
 pub const EPERM: i32 = 1;
@@ -68,13 +63,64 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
-    //  because `check_privilege` will call sudo and drop env if you're not root
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     print_version();
 
-    let conf_file = parse_arg();
+    match parse_args() {
+        Command::OtpFetch(conf_file) => run_otp_fetch(conf_file).await,
+        Command::Connect(conf_file) => run_connect(conf_file).await,
+    }
+}
+
+async fn run_otp_fetch(conf_file: String) -> Result<()> {
+    let mut conf = Config::from_file(&conf_file)
+        .await
+        .context("failed to load config")?;
+
+    if conf.server.is_none() {
+        let resp = corplink_rs::client::get_company_url(conf.company_name.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch company server from company name {}",
+                    conf.company_name
+                )
+            })?;
+        log::info!(
+            "company name is {}(zh)/{}(en) server is {}",
+            resp.zh_name,
+            resp.en_name,
+            resp.domain
+        );
+        conf.server = Some(resp.domain);
+        conf.save()
+            .await
+            .context("failed to persist company server")?;
+    }
+
+    let secret_path = conf.otp_secret_path()?;
+    let mut client = Client::new(conf).context("failed to initialize client")?;
+    log::info!("fetching TOTP secret");
+    let secret = client
+        .fetch_otp_secret()
+        .await
+        .context("failed to fetch TOTP secret")?;
+
+    match secret {
+        Some(_) => {
+            log::info!("TOTP secret exported to {}", secret_path.display());
+            println!("{}", secret_path.display());
+        }
+        None => {
+            log::warn!("no TOTP secret was returned by the server");
+            log::warn!("this can happen with lark/OIDC login (empty otp at connect time)");
+        }
+    }
+    Ok(())
+}
+
+async fn run_connect(conf_file: String) -> Result<()> {
     let mut conf = Config::from_file(&conf_file)
         .await
         .context("failed to load config")?;
@@ -87,8 +133,6 @@ async fn run() -> Result<()> {
     let socks5_password = conf.socks5_password.clone().unwrap_or_default();
     let netstack_mode = socks5_listen.is_some();
 
-    // netstack/socks5 mode runs entirely in userspace (no kernel TUN device,
-    // no system routes/dns), so it does not require elevated privileges.
     if !netstack_mode {
         check_privilege();
     }
@@ -99,7 +143,7 @@ async fn run() -> Result<()> {
     let dns_backup_filename = conf.dns_backup_filename.clone();
 
     if conf.server.is_none() {
-        let resp = client::get_company_url(conf.company_name.as_str())
+        let resp = corplink_rs::client::get_company_url(conf.company_name.as_str())
             .await
             .with_context(|| {
                 format!(
@@ -139,7 +183,6 @@ async fn run() -> Result<()> {
             }
             Err(e) => {
                 if logout_retry && e.to_string().contains("logout") {
-                    // e contains detail message, so just print it out
                     log::warn!("{}", e);
                     logout_retry = false;
                     continue;
@@ -149,7 +192,7 @@ async fn run() -> Result<()> {
             }
         };
     }
-    let wg_conf = wg_conf.ok_or_else(|| anyhow!("wg conf missing after connect loop"))?;
+    let wg_conf = wg_conf.ok_or_else(|| anyhow::anyhow!("wg conf missing after connect loop"))?;
     let protocol = wg_conf.protocol;
     let mut uapi = wg::UAPIClient { name: name.clone() };
     if let Some(listen) = &socks5_listen {
@@ -193,12 +236,6 @@ async fn run() -> Result<()> {
     tokio::select! {
         _ = wait_for_shutdown_signal() => {},
 
-        // keep alive
-        // _ = c.keep_alive_vpn(&wg_conf, 60) => {
-        //     exit_code = ETIMEDOUT;
-        // },
-
-        // check wg handshake and exit if timeout
         _ = async {
             uapi.check_wg_connection().await;
             log::warn!("last handshake timeout");
@@ -207,14 +244,12 @@ async fn run() -> Result<()> {
         },
     }
 
-    // shutdown
     log::info!("disconnecting vpn...");
     if let Err(e) = c.disconnect_vpn(&wg_conf).await {
         log::warn!("failed to disconnect vpn: {}", e)
     };
 
-    // only logout for feilian_v1
-    if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
+    if platform.as_deref() == Some(corplink_rs::config::PLATFORM_CORPLINK_V1) {
         log::info!("logging out current terminal...");
         if let Err(e) = c.logout().await {
             log::warn!("failed to logout: {}", e)
@@ -237,10 +272,6 @@ async fn run() -> Result<()> {
     exit(exit_code)
 }
 
-// Resolve when the process is asked to terminate: ctrl+c (SIGINT) or, on unix,
-// SIGTERM (sent by `docker stop`, systemd, `kill`, etc). Handling SIGTERM lets
-// the graceful shutdown path run — notably the feilian_v1 logout that releases
-// the server-side terminal slot, which is otherwise leaked on every stop.
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {

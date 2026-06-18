@@ -19,10 +19,9 @@ use sha2::Digest;
 
 use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
 use crate::config::{
-    Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
-    PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
+    Config, WgConf, PLATFORM_BYTEDANCE_SSO, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1,
+    PLATFORM_LARK, PLATFORM_LDAP, PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
-use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
@@ -281,6 +280,10 @@ impl Client {
         matches!(self.conf.state.as_ref(), None | Some(State::Init))
     }
 
+    pub fn conf(&self) -> &Config {
+        &self.conf
+    }
+
     async fn check_tps_token(&mut self, token: &String) -> Result<String> {
         // tps confirmed, try to login with token
         let mut m = Map::new();
@@ -311,12 +314,10 @@ impl Client {
     ) -> Result<String> {
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-        match TerminalQrCode::from_bytes(url.as_bytes()) {
-            Ok(qr) => qr.print(),
-            Err(e) => {log::warn!("failed to generate qr code: {e}");}
-        }
+        // Skip terminal QR for now; SSO URLs are long and clutter the console.
+        // Open the link above in a browser or paste it into Feishu to scan.
         match method {
-            PLATFORM_LARK | PLATFORM_OIDC => {
+            PLATFORM_LARK | PLATFORM_OIDC | PLATFORM_BYTEDANCE_SSO => {
                 log::info!("press enter if you finish auth");
                 let stdin = io::stdin();
                 stdin.lines().next();
@@ -378,6 +379,28 @@ impl Client {
             return p.is_empty() || platform == p;
         }
         true
+    }
+
+    async fn store_otp_from_uri(&mut self, otp_uri: &str) -> Result<bool> {
+        if otp_uri.is_empty() {
+            return Ok(false);
+        }
+        let url = Url::parse(otp_uri).context("failed to parse otp uri")?;
+        for (k, v) in url.query_pairs() {
+            if k == "secret" {
+                log::info!("got 2fa token: {}", &v);
+                self.conf.code = Some(v.to_string());
+                let path = self
+                    .conf
+                    .save_otp_secret_file(&v)
+                    .await
+                    .context("failed to save otp secret file")?;
+                log::info!("otp secret saved to {}", path.display());
+                self.conf.save().await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn request_otp_code(&mut self) -> Result<String> {
@@ -473,15 +496,7 @@ impl Client {
                 // same /api/v2/p/otp endpoint and otpauth uri format.
                 match self.request_otp_code().await {
                     Ok(otp_uri) if !otp_uri.is_empty() => {
-                        let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
-                        for (k, v) in url.query_pairs() {
-                            if k == "secret" {
-                                log::info!("got 2fa token: {}", &v);
-                                self.conf.code = Some(v.to_string());
-                                self.conf.save().await?;
-                                break;
-                            }
-                        }
+                        self.store_otp_from_uri(&otp_uri).await?;
                     }
                     Ok(_) => {
                         log::info!(
@@ -499,6 +514,21 @@ impl Client {
                 bail!(msg)
             }
         }
+    }
+
+    pub async fn fetch_otp_secret(&mut self) -> Result<Option<String>> {
+        if self.need_login() {
+            self.login().await.context("login failed")?;
+        } else {
+            match self.request_otp_code().await {
+                Ok(otp_uri) if !otp_uri.is_empty() => {
+                    self.store_otp_from_uri(&otp_uri).await?;
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("failed to refresh otp secret with existing session: {e}"),
+            }
+        }
+        Ok(self.conf.code.clone().filter(|s| !s.is_empty()))
     }
 
     // choose right login method and login
@@ -526,15 +556,7 @@ impl Client {
             }
             self.change_state(State::Login).await?;
 
-            let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
-            for (k, v) in url.query_pairs() {
-                if k == "secret" {
-                    log::info!("got 2fa token: {}", &v);
-                    self.conf.code = Some(v.to_string());
-                    self.conf.save().await?;
-                    break;
-                }
-            }
+            self.store_otp_from_uri(&otp_uri).await?;
 
             if let Some(code) = &self.conf.code {
                 if !code.is_empty() {
@@ -800,7 +822,7 @@ impl Client {
         if otp.is_empty() {
             let is_tps_login = matches!(
                 self.conf.platform.as_deref(),
-                Some(PLATFORM_LARK | PLATFORM_OIDC)
+                Some(PLATFORM_LARK | PLATFORM_OIDC | PLATFORM_BYTEDANCE_SSO)
             );
             if is_tps_login {
                 log::info!("use empty 2fa code (tps login already verified)");

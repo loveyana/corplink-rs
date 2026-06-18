@@ -1,0 +1,7 @@
+{
+  "company_name": "your_company_code",
+  "username": "your_username",
+  "platform": "bytedance_sso",
+  "server": "https://your-corplink-server.example.com:443",
+  "interface_name": "corplink"
+}
