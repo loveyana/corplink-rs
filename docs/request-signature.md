@@ -170,22 +170,22 @@ sequenceDiagram
     participant C as corplink-rs
     participant S as CorpLink API
 
-    Note over C: Login / SSO (unsigned)
-    C->>S: session cookies + csrf-token
+    Note over C: Login / SSO unsigned
+    C->>S: session cookies and csrf-token
 
-    Note over C: ListVPN (signed, params=510)
-    C->>C: "key = HKDF(secret, company|device_id)"
+    Note over C: ListVPN signed params=510
+    C->>C: key = HKDF secret with company|device_id
     C->>C: canonical = selected fields
-    C->>C: "sign = v1;b64(pb(1,510,HMAC))"
-    C->>S: "GET /api/vpn/list?... + Cookie + sign"
+    C->>C: sign = v1;b64 protobuf version=1 params=510 hmac
+    C->>S: GET /api/vpn/list + Cookie + sign
     S-->>C: VPN node list
 
-    Note over C: Probe / pick endpoint (may set vpn-token)
-    C->>S: "GET /vpn/ping?..."
+    Note over C: Probe / pick endpoint may set vpn-token
+    C->>S: GET /vpn/ping
 
-    Note over C: ConnectVPN (signed, params=542)
+    Note over C: ConnectVPN signed params=542
     C->>C: include vpn-token in canonical
-    C->>S: "POST /vpn/conn?... + Cookie + csrf + sign + body"
+    C->>S: POST /vpn/conn + Cookie + csrf + sign + body
     S-->>C: WireGuard peer config
 ```
 
