@@ -341,6 +341,14 @@ curl --socks5-hostname user:pass@127.0.0.1:1080 https://intranet.example.com/
 
 [飞连][1] 是基于 [wg-go][2] 魔改的企业级 VPN 产品
 
+## 请求签名（`sign` header）
+
+新版飞连后端对 `/api/vpn/list` 与 `/vpn/conn` 校验请求签名；缺省会返回 **`11020003 Request signature is empty`**。
+
+本仓库已合并上游 [PR #99](https://github.com/PinkD/corplink-rs/pull/99)（`restore request signature support`）：HKDF 派生密钥 + HMAC 规范串 + protobuf/`v1;` Base64 的 `sign` 头。
+
+详细机制说明见：**[docs/request-signature.md](docs/request-signature.md)**。
+
 ## 配置原理
 
 魔改了配置的方式，加了鉴权
