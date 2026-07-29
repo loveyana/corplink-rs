@@ -174,18 +174,18 @@ sequenceDiagram
     C->>S: session cookies + csrf-token
 
     Note over C: ListVPN (signed, params=510)
-    C->>C: key = HKDF(secret, company\|device_id)
+    C->>C: "key = HKDF(secret, company|device_id)"
     C->>C: canonical = selected fields
-    C->>C: sign = v1;b64(pb(1,510,HMAC))
-    C->>S: GET /api/vpn/list?... + Cookie + sign
+    C->>C: "sign = v1;b64(pb(1,510,HMAC))"
+    C->>S: "GET /api/vpn/list?... + Cookie + sign"
     S-->>C: VPN node list
 
     Note over C: Probe / pick endpoint (may set vpn-token)
-    C->>S: GET /vpn/ping?...
+    C->>S: "GET /vpn/ping?..."
 
     Note over C: ConnectVPN (signed, params=542)
     C->>C: include vpn-token in canonical
-    C->>S: POST /vpn/conn?... + Cookie + csrf + sign + body
+    C->>S: "POST /vpn/conn?... + Cookie + csrf + sign + body"
     S-->>C: WireGuard peer config
 ```
 
