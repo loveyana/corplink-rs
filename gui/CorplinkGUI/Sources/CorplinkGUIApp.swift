@@ -21,7 +21,7 @@ struct CorplinkGUIApp: App {
                 .environmentObject(controller)
                 .onAppear {
                     controller.startMonitoring()
-                    appDelegate.controller = controller
+                    appDelegate.bind(controller: controller)
                 }
         } label: {
             Image(systemName: controller.isConnected ? "lock.shield.fill" : "lock.shield")
@@ -29,12 +29,18 @@ struct CorplinkGUIApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    weak var controller: VPNController?
+    private weak var controller: VPNController?
+    private let otpHotKey = GlobalHotKey()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Stay as accessory+regular so menu bar icon remains after window close.
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        otpHotKey.unregister()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -46,9 +52,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        // Dock click / reopen — show main window.
         NotificationCenter.default.post(name: .corplinkShowMainWindow, object: nil)
         return true
+    }
+
+    /// Wire controller + (re)register the configured global OTP hotkey.
+    @MainActor
+    func bind(controller: VPNController) {
+        self.controller = controller
+        controller.onOTPHotKeyPreferenceChanged = { [weak self] option in
+            self?.registerOTPHotKey(option)
+        }
+        registerOTPHotKey(controller.otpGlobalHotKey)
+    }
+
+    @MainActor
+    private func registerOTPHotKey(_ option: OTPGlobalHotKeyOption) {
+        otpHotKey.onPressed = { [weak self] in
+            Task { @MainActor in
+                self?.controller?.copyOTP(fromGlobalHotKey: true)
+            }
+        }
+        let result = otpHotKey.register(option: option)
+        controller?.updateOTPHotKeyStatus(result)
+        switch result {
+        case .success:
+            NSLog("GlobalHotKey: registered \(option.displayName) for Copy OTP")
+        case .disabled:
+            NSLog("GlobalHotKey: disabled")
+        case .conflict:
+            NSLog("GlobalHotKey: conflict on \(option.displayName) — not armed")
+        case .failed(let code):
+            NSLog("GlobalHotKey: failed OSStatus=\(code)")
+        }
     }
 }
 

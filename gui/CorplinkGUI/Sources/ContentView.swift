@@ -180,9 +180,22 @@ struct ContentView: View {
                             .buttonStyle(CLGhostButtonStyle())
                             .disabled(controller.otpCode.isEmpty)
                             .opacity(controller.otpCode.isEmpty ? 0.4 : 1)
+                            .help("Copy OTP — global \(controller.otpGlobalHotKey.displayName)")
                     }
                 }
             }
+
+            Text(controller.otpHotKeyStatusText)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(otpHotKeyColor)
+        }
+    }
+
+    private var otpHotKeyColor: Color {
+        switch controller.otpHotKeyStatus {
+        case .conflict, .failed: return CLTheme.warn
+        case .disabled: return Color.white.opacity(0.28)
+        case .success: return Color.white.opacity(0.38)
         }
     }
 

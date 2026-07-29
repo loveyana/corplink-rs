@@ -7,7 +7,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CorplinkGUI",
-            path: "Sources"
+            path: "Sources",
+            linkerSettings: [
+                .linkedFramework("Carbon"),
+            ]
         )
     ]
 )

@@ -40,6 +40,12 @@ final class VPNController: ObservableObject {
     @Published var pendingApply = false
     /// Short Chinese hint for the pending-apply banner.
     @Published var pendingApplyHint = ""
+    /// Preferred global OTP hotkey (persisted in gui_settings.json).
+    @Published var otpGlobalHotKey: OTPGlobalHotKeyOption = .default
+    /// Last registration result for the OTP global hotkey.
+    @Published var otpHotKeyStatus: GlobalHotKeyRegisterResult = .disabled
+    /// Callback used by AppDelegate to (re)register Carbon hotkey after preference changes.
+    var onOTPHotKeyPreferenceChanged: ((OTPGlobalHotKeyOption) -> Void)?
 
     let repoRoot: URL
     let binaryPath: String
@@ -47,6 +53,7 @@ final class VPNController: ObservableObject {
     let logPath: String
     let nodeCachePath: String
     let latencyCachePath: String
+    let guiSettingsPath: String
     let startScript: String
     let stopScript: String
     let runScript: String
@@ -75,6 +82,7 @@ final class VPNController: ObservableObject {
         logPath = env["CORPLINK_LOG"] ?? "/tmp/corplink-gui.log"
         nodeCachePath = repoRoot.appendingPathComponent("config/vpn_nodes_cache.json").path
         latencyCachePath = repoRoot.appendingPathComponent("config/vpn_latency_cache.json").path
+        guiSettingsPath = repoRoot.appendingPathComponent("config/gui_settings.json").path
         startScript = repoRoot.appendingPathComponent("gui/scripts/vpn-start.sh").path
         stopScript = repoRoot.appendingPathComponent("gui/scripts/vpn-stop.sh").path
         runScript = repoRoot.appendingPathComponent("gui/scripts/vpn-run.sh").path
@@ -90,7 +98,81 @@ final class VPNController: ObservableObject {
         knownNodes = Self.loadNodeCache(path: nodeCachePath)
         if knownNodes.isEmpty { knownNodes = Self.seedNodes }
         applyLatencyCache(Self.loadLatencyCache(path: latencyCachePath))
+        otpGlobalHotKey = Self.loadGUISettings(path: guiSettingsPath).otpGlobalHotKey
         suppressNodeWrite = false
+    }
+
+    var otpHotKeyStatusText: String {
+        switch otpHotKeyStatus {
+        case .success:
+            return "Global \(otpGlobalHotKey.displayName)"
+        case .disabled:
+            return "Global hotkey off"
+        case .conflict:
+            return "\(otpGlobalHotKey.displayName) 冲突，请换一个"
+        case .failed:
+            return "Global hotkey failed"
+        }
+    }
+
+    func setOTPGlobalHotKey(_ option: OTPGlobalHotKeyOption) {
+        otpGlobalHotKey = option
+        saveGUISettings()
+        onOTPHotKeyPreferenceChanged?(option)
+    }
+
+    func updateOTPHotKeyStatus(_ result: GlobalHotKeyRegisterResult) {
+        otpHotKeyStatus = result
+        switch result {
+        case .success:
+            // Don't clobber VPN status lines unless we just changed the binding.
+            break
+        case .disabled:
+            break
+        case .conflict:
+            statusText = "\(otpGlobalHotKey.displayName) 已被占用，请在菜单更换快捷键"
+            lastError = "全局快捷键 \(otpGlobalHotKey.displayName) 与其他 App 冲突，未启用。可在菜单栏 → OTP Hotkey 中更换。"
+        case .failed(let code):
+            lastError = "全局快捷键注册失败 (OSStatus \(code))"
+        }
+    }
+
+    private func saveGUISettings() {
+        Self.writeGUISettings(
+            GUISettings(otpGlobalHotKey: otpGlobalHotKey),
+            path: guiSettingsPath
+        )
+    }
+
+    private struct GUISettings {
+        var otpGlobalHotKey: OTPGlobalHotKeyOption
+    }
+
+    nonisolated private static func loadGUISettings(path: String) -> GUISettings {
+        // Prefer file; fall back to UserDefaults for older installs.
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let raw = obj["otp_global_hotkey"] as? String,
+           let opt = OTPGlobalHotKeyOption(rawValue: raw) {
+            return GUISettings(otpGlobalHotKey: opt)
+        }
+        if let raw = UserDefaults.standard.string(forKey: "otpGlobalHotKey"),
+           let opt = OTPGlobalHotKeyOption(rawValue: raw) {
+            return GUISettings(otpGlobalHotKey: opt)
+        }
+        return GUISettings(otpGlobalHotKey: .default)
+    }
+
+    nonisolated private static func writeGUISettings(_ settings: GUISettings, path: String) {
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = [
+            "otp_global_hotkey": settings.otpGlobalHotKey.rawValue,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+        UserDefaults.standard.set(settings.otpGlobalHotKey.rawValue, forKey: "otpGlobalHotKey")
     }
 
     var nodePickerOptions: [String] {
@@ -198,11 +280,24 @@ final class VPNController: ObservableObject {
         otpTimer = nil
     }
 
-    func copyOTP() {
-        guard !otpCode.isEmpty else { return }
+    /// Copy current OTP to the pasteboard.
+    /// - Parameter fromGlobalHotKey: when true, give audible feedback if OTP is missing
+    ///   (useful when the window / menu is not visible).
+    @discardableResult
+    func copyOTP(fromGlobalHotKey: Bool = false) -> Bool {
+        guard !otpCode.isEmpty else {
+            if fromGlobalHotKey {
+                NSSound.beep()
+                statusText = "OTP unavailable"
+            }
+            return false
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(otpCode, forType: .string)
-        statusText = "OTP copied"
+        statusText = fromGlobalHotKey
+            ? "OTP copied (\(otpGlobalHotKey.displayName))"
+            : "OTP copied"
+        return true
     }
 
     func connect() {

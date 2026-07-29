@@ -16,6 +16,7 @@
 /utun*_cookies.json
 *_latency_cache.json
 *_nodes_cache.json
+gui_settings.json
 
 # Keys / certs
 *.pem

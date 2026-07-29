@@ -32,9 +32,25 @@ struct MenuBarView: View {
                 controller.copyOTP()
             }
             .keyboardShortcut("c", modifiers: [.command, .shift])
+            Text(controller.otpHotKeyStatusText)
+                .font(.caption)
+                .foregroundStyle(hotKeyCaptionColor)
         } else {
             Text("OTP unavailable")
                 .foregroundStyle(.secondary)
+            Text(controller.otpHotKeyStatusText)
+                .font(.caption)
+                .foregroundStyle(hotKeyCaptionColor)
+        }
+
+        Menu("OTP Hotkey") {
+            ForEach(OTPGlobalHotKeyOption.allCases) { option in
+                Button {
+                    controller.setOTPGlobalHotKey(option)
+                } label: {
+                    hotKeyOptionLabel(option)
+                }
+            }
         }
 
         Divider()
@@ -139,6 +155,26 @@ struct MenuBarView: View {
     private func nodeLabel(_ name: String) -> some View {
         let title = controller.displayName(for: name)
         if controller.selectedNode == name {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
+    }
+
+    private var hotKeyCaptionColor: Color {
+        switch controller.otpHotKeyStatus {
+        case .conflict, .failed: return .orange
+        case .disabled: return .secondary
+        case .success: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func hotKeyOptionLabel(_ option: OTPGlobalHotKeyOption) -> some View {
+        let selected = controller.otpGlobalHotKey == option
+        let conflicted = selected && controller.otpHotKeyStatus == .conflict
+        let title = conflicted ? "\(option.menuLabel) (conflict)" : option.menuLabel
+        if selected {
             Label(title, systemImage: "checkmark")
         } else {
             Text(title)
