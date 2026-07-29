@@ -169,34 +169,34 @@ How `sign_request` builds the `sign` header:
 
 ```mermaid
 flowchart TD
-    A[API call ListVPN or ConnectVPN] --> B{Needs sign?}
+    A[API call ListVPN or ConnectVPN] --> B{Needs sign}
     B -->|other APIs| Z[Skip signing]
-    B -->|ListVPN 510 or ConnectVPN 542| C{device_id present?}
-    C -->|no| E1[Error: missing device_id]
-    C -->|yes| D[info = company_name + device_id]
-    D --> F[key = HKDF-SHA256 from SIGN_SECRET]
-    F --> G[Collect fields 1..9]
+    B -->|ListVPN 510 or ConnectVPN 542| C{device_id present}
+    C -->|no| E1[Error missing device_id]
+    C -->|yes| D[info is company_name and device_id]
+    D --> F[derive key via HKDF-SHA256]
+    F --> G[Collect fields 1 to 9]
     G --> H[method path query body-hash Cookie empty csrf empty vpn-token]
-    H --> I{For each bit i in 1..9}
-    I -->|bit set in params| J[Append field bytes to canonical]
+    H --> I{For each bit}
+    I -->|bit set| J[Append field bytes to canonical]
     I -->|bit clear| K[Skip field]
-    J --> L
+    J --> L{More bits}
     K --> L
-    L{More bits?} -->|yes| I
-    L -->|no| M[HMAC-SHA256 key over canonical]
-    M --> N[Protobuf version + params + hmac]
-    N --> O[sign header = v1 plus Base64 protobuf]
-    O --> P[Attach HTTP header and send request]
+    L -->|yes| I
+    L -->|no| M[HMAC-SHA256 over canonical]
+    M --> N[Pack protobuf version params hmac]
+    N --> O[Build sign header v1 plus Base64]
+    O --> P[Attach HTTP header and send]
 ```
 
 Bitmap branch (what gets into `canonical`):
 
 ```mermaid
 flowchart LR
-    subgraph listvpn [ListVPN params=510]
+    subgraph listvpn [ListVPN params 510]
         L1[method path query body-hash Cookie empty csrf empty]
     end
-    subgraph connectvpn [ConnectVPN params=542]
+    subgraph connectvpn [ConnectVPN params 542]
         C1[method path query body-hash Cookie vpn-token]
     end
 ```
@@ -213,19 +213,19 @@ sequenceDiagram
     Note over C: Login / SSO unsigned
     C->>S: session cookies and csrf-token
 
-    Note over C: ListVPN signed params=510
-    C->>C: key = HKDF secret with company and device_id
-    C->>C: canonical = selected fields
-    C->>C: sign header = v1 plus b64 protobuf
-    C->>S: GET /api/vpn/list + Cookie + sign
+    Note over C: ListVPN signed params 510
+    C->>C: key equals HKDF of secret with company and device_id
+    C->>C: canonical equals selected fields
+    C->>C: sign header equals v1 plus b64 protobuf
+    C->>S: GET list API with Cookie and sign
     S-->>C: VPN node list
 
     Note over C: Probe / pick endpoint may set vpn-token
-    C->>S: GET /vpn/ping
+    C->>S: GET vpn ping
 
-    Note over C: ConnectVPN signed params=542
+    Note over C: ConnectVPN signed params 542
     C->>C: include vpn-token in canonical
-    C->>S: POST /vpn/conn + Cookie + csrf + sign + body
+    C->>S: POST conn API with Cookie csrf sign and body
     S-->>C: WireGuard peer config
 ```
 ---
