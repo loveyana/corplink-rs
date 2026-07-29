@@ -18,13 +18,16 @@ use corplink_rs::wg;
 enum Command {
     Connect(String),
     OtpFetch(String),
+    /// Probe all VPN node latencies. Second flag enables interactive login if needed.
+    Nodes { conf_file: String, allow_login: bool },
 }
 
 fn print_usage_and_exit(name: &str) -> ! {
     eprintln!(
         "usage:\n\
-         \t{name} <config.json>              connect vpn (default config: config.json)\n\
-         \t{name} otp fetch <config.json>     login and export TOTP secret only\n\
+         \t{name} <config.json>                    connect vpn (default config: config.json)\n\
+         \t{name} otp fetch <config.json>           login and export TOTP secret only\n\
+         \t{name} nodes [--login] <config.json>     probe VPN node latencies (JSON to stdout)\n\
          \t{name} -h | --help"
     );
     exit(1)
@@ -34,18 +37,35 @@ fn parse_args() -> Command {
     let mut args: Vec<String> = env::args().collect();
     let name = args.first().cloned().unwrap_or_else(|| "corplink-rs".to_string());
     args.remove(0);
+    let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    match args.len() {
-        0 => Command::Connect("config.json".to_string()),
-        1 => match args[0].as_str() {
-            "-h" | "--help" => print_usage_and_exit(&name),
-            path => Command::Connect(path.to_string()),
+    match args.as_slice() {
+        [] => Command::Connect("config.json".to_string()),
+        ["-h" | "--help"] => print_usage_and_exit(&name),
+        ["nodes"] => Command::Nodes {
+            conf_file: "config.json".to_string(),
+            allow_login: false,
         },
-        2 if args[0] == "otp" && args[1] == "fetch" => print_usage_and_exit(&name),
-        3 if args[0] == "otp" && args[1] == "fetch" => match args[2].as_str() {
-            "-h" | "--help" => print_usage_and_exit(&name),
-            path => Command::OtpFetch(path.to_string()),
+        ["nodes", "--login"] => Command::Nodes {
+            conf_file: "config.json".to_string(),
+            allow_login: true,
         },
+        ["nodes", "--login", path] => Command::Nodes {
+            conf_file: path.to_string(),
+            allow_login: true,
+        },
+        ["nodes", path, "--login"] => Command::Nodes {
+            conf_file: path.to_string(),
+            allow_login: true,
+        },
+        ["nodes", path] => Command::Nodes {
+            conf_file: path.to_string(),
+            allow_login: false,
+        },
+        ["otp", "fetch"] => print_usage_and_exit(&name),
+        ["otp", "fetch", "-h" | "--help"] => print_usage_and_exit(&name),
+        ["otp", "fetch", path] => Command::OtpFetch(path.to_string()),
+        [path] => Command::Connect(path.to_string()),
         _ => print_usage_and_exit(&name),
     }
 }
@@ -69,8 +89,52 @@ async fn run() -> Result<()> {
 
     match parse_args() {
         Command::OtpFetch(conf_file) => run_otp_fetch(conf_file).await,
+        Command::Nodes {
+            conf_file,
+            allow_login,
+        } => run_nodes(conf_file, allow_login).await,
         Command::Connect(conf_file) => run_connect(conf_file).await,
     }
+}
+
+async fn run_nodes(conf_file: String, allow_login: bool) -> Result<()> {
+    let mut conf = Config::from_file(&conf_file)
+        .await
+        .context("failed to load config")?;
+
+    if conf.server.is_none() {
+        let resp = corplink_rs::client::get_company_url(conf.company_name.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch company server from company name {}",
+                    conf.company_name
+                )
+            })?;
+        log::info!(
+            "company name is {}(zh)/{}(en) server is {}",
+            resp.zh_name,
+            resp.en_name,
+            resp.domain
+        );
+        conf.server = Some(resp.domain);
+        conf.save()
+            .await
+            .context("failed to persist company server")?;
+    }
+
+    let mut client = Client::new(conf).context("failed to initialize client")?;
+    let entries = client
+        .measure_vpn_latencies(allow_login)
+        .await
+        .context("failed to probe VPN latencies")?;
+
+    // JSON only on stdout so GUI / scripts can parse cleanly (logs go to stderr).
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&entries).context("serialize latency JSON")?
+    );
+    Ok(())
 }
 
 async fn run_otp_fetch(conf_file: String) -> Result<()> {

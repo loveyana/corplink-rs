@@ -16,6 +16,7 @@ use reqwest::header;
 use reqwest::{ClientBuilder, Response, Url};
 use reqwest_cookie_store::CookieStoreMutex;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -228,6 +229,24 @@ struct SelectedVpn {
     set_cookie_headers: Vec<header::HeaderValue>,
 }
 
+/// One VPN node latency probe result (for CLI / GUI cache).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VpnLatencyEntry {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VpnLatencyCache {
+    pub updated_at: u64,
+    pub nodes: Vec<VpnLatencyEntry>,
+}
+
+const LATENCY_CACHE_FILE: &str = "vpn_latency_cache.json";
+
 unsafe impl Send for Client {}
 
 unsafe impl Sync for Client {}
@@ -362,18 +381,32 @@ impl Client {
             None => path::Path::new("."),
         };
         let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
-        let mut file = fs::OpenOptions::new()
+        let mut file = match fs::OpenOptions::new()
             .write(true)
             .create(true)
             .append(false)
             .open(&cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| {
-                format!(
-                    "failed to open cookie file for writing: {}",
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                // Cookies are often owned by root when VPN was started via admin GUI.
+                // Keep in-memory cookies usable for user-space probes (e.g. `nodes`).
+                log::warn!(
+                    "cannot write cookie file {} (permission denied); continuing with in-memory cookies",
                     cookie_file.display()
-                )
-            })?;
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to open cookie file for writing: {}",
+                        cookie_file.display()
+                    )
+                });
+            }
+        };
         let c = self
             .cookie
             .lock()
@@ -642,6 +675,58 @@ impl Client {
         }
     }
 
+    /// Used by the GUI wrapper:
+    /// 1) wait until CORPLINK_AUTH_GATE is created (user clicked "我已完成登录")
+    /// 2) then poll SSO completion
+    async fn poll_tps_token_until_ready(&mut self, token: &String) -> Result<String> {
+        let gate = std::env::var("CORPLINK_AUTH_GATE")
+            .unwrap_or_else(|_| "/tmp/corplink-gui-auth.gate".to_string());
+        log::info!(
+            "CORPLINK_GUI: waiting for confirm file before SSO poll: {gate}"
+        );
+        log::info!("CORPLINK_GUI: open the SSO link, then click Confirm in the GUI");
+
+        // Wait up to ~10 minutes for the user to finish browser login and confirm.
+        const GATE_INTERVAL_MS: u64 = 500;
+        const GATE_MAX_ATTEMPTS: u32 = 1200;
+        for attempt in 1..=GATE_MAX_ATTEMPTS {
+            if path::Path::new(&gate).exists() {
+                log::info!("CORPLINK_GUI: confirm received, polling SSO token");
+                break;
+            }
+            if attempt == 1 || attempt % 20 == 0 {
+                log::info!(
+                    "CORPLINK_GUI: still waiting for GUI confirm ({attempt}/{GATE_MAX_ATTEMPTS})"
+                );
+            }
+            if attempt == GATE_MAX_ATTEMPTS {
+                bail!("CORPLINK_GUI: timed out waiting for GUI confirm ({gate})");
+            }
+            tokio::time::sleep(Duration::from_millis(GATE_INTERVAL_MS)).await;
+        }
+
+        const INTERVAL_SECS: u64 = 2;
+        const MAX_ATTEMPTS: u32 = 90; // ~3 minutes after confirm
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.check_tps_token(token).await {
+                Ok(url) => {
+                    log::info!("CORPLINK_GUI: SSO auth confirmed");
+                    let _ = fs::remove_file(&gate);
+                    return Ok(url);
+                }
+                Err(e) => {
+                    if attempt == 1 || attempt % 10 == 0 {
+                        log::info!(
+                            "CORPLINK_GUI: waiting for SSO auth (attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(INTERVAL_SECS)).await;
+        }
+        bail!("CORPLINK_GUI: timed out waiting for SSO auth after confirm")
+    }
+
     async fn get_otp_uri_from_tps(
         &mut self,
         method: &str,
@@ -650,23 +735,18 @@ impl Client {
     ) -> Result<String> {
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-<<<<<<< HEAD
-        // Skip terminal QR for now; SSO URLs are long and clutter the console.
-        // Open the link above in a browser or paste it into Feishu to scan.
-=======
-        match TerminalQrCode::from_bytes(url.as_bytes()) {
-            Ok(qr) => qr.print(),
-            Err(e) => {
-                log::warn!("failed to generate qr code: {e}");
-            }
-        }
->>>>>>> pr-99-signature
+        // Skip terminal QR for long SSO URLs; open the link in a browser instead.
         match method {
             PLATFORM_LARK | PLATFORM_OIDC | PLATFORM_BYTEDANCE_SSO => {
-                log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
-                self.check_tps_token(token).await
+                if std::env::var_os("CORPLINK_GUI").is_some() {
+                    log::info!("CORPLINK_GUI: open the SSO link above, polling until auth completes");
+                    self.poll_tps_token_until_ready(token).await
+                } else {
+                    log::info!("press enter if you finish auth");
+                    let stdin = io::stdin();
+                    stdin.lines().next();
+                    self.check_tps_token(token).await
+                }
             }
             _ => {
                 // TODO: add all tps login support
@@ -1050,19 +1130,109 @@ impl Client {
         }
     }
 
-    async fn get_first_vpn_by_latency(&self, vpn_info: Vec<RespVpnInfo>) -> Option<SelectedVpn> {
-        let mut fastest: Option<(i64, usize, SelectedVpn)> = None;
+    /// List VPN nodes, probe latency concurrently, persist cache, return results.
+    /// Does not require root. When `allow_login` is false and cookies are missing,
+    /// returns an error instead of starting interactive SSO.
+    pub async fn measure_vpn_latencies(&mut self, allow_login: bool) -> Result<Vec<VpnLatencyEntry>> {
+        if self.need_login() {
+            if !allow_login {
+                bail!("not logged in; connect once first, or run: corplink-rs nodes --login <config.json>");
+            }
+            log::info!("not login yet, try to login before latency probe");
+            self.login().await.context("login failed")?;
+            log::info!("login success");
+        }
+        let vpn_info = self.list_vpn().await?;
+        let probed = self.probe_vpn_list(vpn_info).await;
+        let entries = Self::latency_entries_from_probes(&probed);
+        if let Err(err) = self.write_latency_cache(&entries) {
+            log::warn!("failed to write latency cache: {err:#}");
+        }
+        Ok(entries)
+    }
 
+    fn latency_cache_path(&self) -> Option<path::PathBuf> {
+        let conf_file = self.conf.conf_file.as_ref()?;
+        let dir = path::Path::new(conf_file).parent().unwrap_or(path::Path::new("."));
+        Some(dir.join(LATENCY_CACHE_FILE))
+    }
+
+    fn write_latency_cache(&self, entries: &[VpnLatencyEntry]) -> Result<()> {
+        let path = self
+            .latency_cache_path()
+            .context("config file path missing for latency cache")?;
+        let updated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cache = VpnLatencyCache {
+            updated_at,
+            nodes: entries.to_vec(),
+        };
+        let body = serde_json::to_string_pretty(&cache).context("serialize latency cache")?;
+        fs::write(&path, body)
+            .with_context(|| format!("write latency cache {}", path.display()))?;
+        log::info!("wrote latency cache to {}", path.display());
+        Ok(())
+    }
+
+    fn latency_entries_from_probes(
+        probed: &[(usize, RespVpnInfo, Result<VpnProbeResponse, String>)],
+    ) -> Vec<VpnLatencyEntry> {
+        let mut entries: Vec<VpnLatencyEntry> = probed
+            .iter()
+            .map(|(_, vpn, result)| match result {
+                Ok(response) => VpnLatencyEntry {
+                    name: vpn.en_name.clone(),
+                    latency_ms: Some(response.latency_ms),
+                    error: None,
+                },
+                Err(err) => VpnLatencyEntry {
+                    name: vpn.en_name.clone(),
+                    latency_ms: None,
+                    error: Some(err.clone()),
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| match (a.latency_ms, b.latency_ms) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        });
+        entries
+    }
+
+    async fn probe_vpn_list(
+        &self,
+        vpn_info: Vec<RespVpnInfo>,
+    ) -> Vec<(usize, RespVpnInfo, Result<VpnProbeResponse, String>)> {
+        let mut results = Vec::with_capacity(vpn_info.len());
         let mut probes = vpn_info
             .into_iter()
             .enumerate()
             .map(|(index, vpn)| async move {
                 let result = self.ping_vpn(&vpn.ip, vpn.api_port).await;
-                (index, vpn, result)
+                (index, vpn, result.map_err(|e| format!("{e:#}")))
             })
             .collect::<FuturesUnordered<_>>();
 
-        while let Some((index, vpn, result)) = probes.next().await {
+        while let Some(item) = probes.next().await {
+            results.push(item);
+        }
+        results.sort_by_key(|(index, _, _)| *index);
+        results
+    }
+
+    async fn get_first_vpn_by_latency(&self, vpn_info: Vec<RespVpnInfo>) -> Option<SelectedVpn> {
+        let mut fastest: Option<(i64, usize, SelectedVpn)> = None;
+        let probed = self.probe_vpn_list(vpn_info).await;
+        let entries = Self::latency_entries_from_probes(&probed);
+        if let Err(err) = self.write_latency_cache(&entries) {
+            log::warn!("failed to write latency cache: {err:#}");
+        }
+
+        for (index, vpn, result) in probed {
             match result {
                 Ok(response) => {
                     log::info!(

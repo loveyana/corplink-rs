@@ -13,6 +13,16 @@
 *_otp_secret.json
 *cookies.json
 /corplink_cookies.json
+/utun*_cookies.json
+*_latency_cache.json
+*_nodes_cache.json
+
+# Keys / certs
+*.pem
+*.p12
+*.key
+*.crt
+!config.example.json
 
 # libwg build artifacts
 libwg/libwg.a
@@ -22,9 +32,22 @@ libwg/version.go
 # release artifacts
 /release/
 *.zip
+*.tar.gz
+*.dmg
+
+# GUI / Swift build products (rebuild with gui/build.sh)
+/gui/**/.build/
+/gui/*.app/
+/gui/CorplinkGUI.app/
+.swiftpm/
+
+# macOS
+.DS_Store
 
 # graphify knowledge graph output
 /graphify-out/
 
 # runtime logs
 /log/
+/tmp-corplink*
+*.log
