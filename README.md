@@ -197,6 +197,21 @@ RUST_LOG=debug ./corplink-rs config.json
   // - full:  use full-tunnel routes from server
   //          often combined with "auto_setup_routes": false in container/gateway setups
   "route_mode": "split",
+  // optional CIDRs added to the server-provided routes before filtering. unlike
+  // vpn_allowed_routes, this can introduce networks not covered by server routes.
+  // the combined routes are still subject to the allowlist and denylist below.
+  "vpn_additional_routes": ["20.205.243.160/28"],
+  // optional exact hostnames resolved on every VPN connection/reconnection.
+  // each IPv4 result is appended as a /32 route; IPv6 results are appended as
+  // /128 routes only when the server assigns an IPv6 tunnel address.
+  "vpn_additional_domains": ["github.com", "api.github.com"],
+  // optional strict CIDR whitelist. each entry is intersected with the routes
+  // returned by the server plus the additional routes above. an empty list allows
+  // no routes; missing/null preserves all routes. when both lists are set,
+  // vpn_disallowed_routes is subtracted after this whitelist. the allowlist must
+  // also cover every additional route that should be retained, so leave it unset
+  // when using domain routes whose resolved addresses are not known in advance.
+  // "vpn_allowed_routes": ["192.168.2.0/24"],
   // optional: list of CIDRs to carve out of AllowedIPs (and system routes).
   // applied as CIDR subtraction: each entry is subtracted from every route
   // returned by the server, so listing a smaller range like "10.68.0.0/16"
@@ -301,6 +316,7 @@ graph TD;
 # TODO
 
 - [ ] 使用 [Tauri][7] 实现界面(~~或许大概可能永远不会有~~)
+  - 参考实现：https://github.com/huangzheng2016/ecorplink
 - [x] 实现 TCP 版的 wg 协议
 - [x] 为不同配置生成不同的 `cookies.json`
 - [x] windows/mac 实现
@@ -310,6 +326,11 @@ graph TD;
 
 # Changelog
 
+- 0.5.5
+  - add more route configs(@yanickxia @zier-one @kfxhjz @ZeppLu)
+  - support protocol override config(@n-WN)
+  - usermode proxy with socks5(@wilinz)
+  - minor fix(@Ben8368 @huangzheng2016)
 - 0.5.4
   - fix memory leak in unsafe code
   - refactor error handling with `anyhow`
@@ -391,8 +412,8 @@ graph TD;
 # License
 
 ```license
- Copyright (C) 2023  PinkD, ShuNing, LionheartLann, XYenon, Verge, jixiuf,
- simpleapples, overvenus, fanwenlin, hexchain, ManiaciaChao, yanyongyu
+ Copyright (C) 2022-2026  PinkD
+ Other contributors: https://github.com/PinkD/corplink-rs/graphs/contributors
 
     This program is free software; you can redistribute it and/or
     modify it under the terms of the GNU General Public License

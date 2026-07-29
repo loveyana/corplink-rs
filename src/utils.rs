@@ -77,6 +77,67 @@ pub fn feilian_v1_encrypt_password(password: &str) -> String {
     hex::encode(ct)
 }
 
+/// Returns whether `cidr` is a parseable IPv4 or IPv6 CIDR.
+pub fn is_valid_cidr(cidr: &str) -> bool {
+    parse_cidr(cidr).is_some()
+}
+
+/// Returns the intersection of two CIDRs, or `None` when they are disjoint,
+/// use different address families, or either input is invalid.
+pub fn intersect_cidr_with_cidr(first: &str, second: &str) -> Option<String> {
+    let (first_base, first_prefix) = parse_cidr(first)?;
+    let (second_base, second_prefix) = parse_cidr(second)?;
+    if !same_family(first_base, second_base) {
+        return None;
+    }
+    if first_prefix >= second_prefix
+        && cidr_contains_ip(second_base, second_prefix, first_base)
+    {
+        return Some(format!("{first_base}/{first_prefix}"));
+    }
+    if second_prefix >= first_prefix
+        && cidr_contains_ip(first_base, first_prefix, second_base)
+    {
+        return Some(format!("{second_base}/{second_prefix}"));
+    }
+    None
+}
+
+/// Applies the optional CIDR allowlist, followed by the optional denylist, to
+/// server-supplied routes. A missing allowlist preserves the server routes,
+/// while an explicitly empty allowlist permits no routes.
+pub fn apply_route_filters(
+    server_routes: &[String],
+    allowed_routes: Option<&[String]>,
+    disallowed_routes: Option<&[String]>,
+) -> Vec<String> {
+    let mut routes = match allowed_routes {
+        None => server_routes.to_vec(),
+        Some(allowed) => {
+            let mut intersections = Vec::new();
+            for server in server_routes {
+                for allowed_route in allowed {
+                    if let Some(route) = intersect_cidr_with_cidr(server, allowed_route) {
+                        if !intersections.contains(&route) {
+                            intersections.push(route);
+                        }
+                    }
+                }
+            }
+            intersections
+        }
+    };
+    if let Some(disallowed) = disallowed_routes {
+        for excluded in disallowed {
+            routes = routes
+                .iter()
+                .flat_map(|route| subtract_cidr_from_cidr(route, excluded))
+                .collect();
+        }
+    }
+    routes
+}
+
 /// Returns a list of CIDR strings covering all addresses in `outer` except those in `inner`.
 ///
 /// - Disjoint (no overlap) → `[outer]` unchanged.
@@ -237,6 +298,83 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    #[test]
+    fn intersect_returns_the_narrower_cidr() {
+        assert_eq!(
+            intersect_cidr_with_cidr("10.0.0.0/8", "10.1.0.0/16"),
+            Some("10.1.0.0/16".to_string())
+        );
+        assert_eq!(
+            intersect_cidr_with_cidr("10.1.0.0/16", "10.0.0.0/8"),
+            Some("10.1.0.0/16".to_string())
+        );
+    }
+
+    #[test]
+    fn intersect_rejects_disjoint_invalid_and_mixed_family_cidrs() {
+        assert_eq!(
+            intersect_cidr_with_cidr("10.0.0.0/8", "192.168.0.0/16"),
+            None
+        );
+        assert_eq!(
+            intersect_cidr_with_cidr("10.0.0.0/8", "2001:db8::/32"),
+            None
+        );
+        assert_eq!(intersect_cidr_with_cidr("10.0.0.0/8", "invalid"), None);
+    }
+
+    #[test]
+    fn intersect_supports_ipv6_and_canonicalizes_the_result() {
+        assert_eq!(
+            intersect_cidr_with_cidr("2001:db8::/32", "2001:db8:1::7/48"),
+            Some("2001:db8:1::/48".to_string())
+        );
+    }
+
+    #[test]
+    fn route_filters_deduplicate_intersections_in_stable_order() {
+        let server = vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()];
+        let allowed = vec![
+            "192.168.1.0/24".to_string(),
+            "10.1.0.0/16".to_string(),
+            "10.1.0.0/16".to_string(),
+        ];
+        assert_eq!(
+            apply_route_filters(&server, Some(allowed.as_slice()), None),
+            vec!["10.1.0.0/16", "192.168.1.0/24"]
+        );
+    }
+
+    #[test]
+    fn route_filters_distinguish_missing_and_empty_allowlists() {
+        let server = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(apply_route_filters(&server, None, None), server);
+        assert!(apply_route_filters(&server, Some(&[]), None).is_empty());
+    }
+
+    #[test]
+    fn route_filters_fail_closed_for_invalid_allowlist_entries() {
+        let server = vec!["10.0.0.0/8".to_string()];
+        let allowed = vec!["invalid".to_string()];
+        assert!(apply_route_filters(&server, Some(allowed.as_slice()), None).is_empty());
+    }
+
+    #[test]
+    fn route_filters_apply_allowlist_before_denylist() {
+        let server = vec!["10.0.0.0/8".to_string()];
+        let allowed = vec!["10.1.0.0/16".to_string()];
+        let disallowed = vec!["10.1.1.0/24".to_string()];
+        let out = apply_route_filters(
+            &server,
+            Some(allowed.as_slice()),
+            Some(disallowed.as_slice()),
+        );
+        assert_eq!(
+            sorted(out),
+            sorted(subtract_cidr_from_cidr("10.1.0.0/16", "10.1.1.0/24"))
+        );
     }
 
     #[test]

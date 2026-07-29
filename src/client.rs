@@ -1,15 +1,17 @@
-use chrono::Utc;
 use std::collections::HashMap;
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cookie::Cookie as RawCookie;
 use cookie_store::{Cookie, CookieStore};
+use futures::stream::{FuturesUnordered, StreamExt};
+use reqwest::cookie::CookieStore as ReqwestCookieStore;
 use reqwest::header;
 use reqwest::{ClientBuilder, Response, Url};
 use reqwest_cookie_store::CookieStoreMutex;
@@ -17,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
-use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
+use crate::api::{ApiName, ApiUrl, CORPLINK_APP_VERSION, URL_GET_COMPANY};
 use crate::config::{
     Config, WgConf, PLATFORM_BYTEDANCE_SSO, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1,
     PLATFORM_LARK, PLATFORM_LDAP, PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
@@ -28,15 +30,202 @@ use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
-const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
+const SIGN_ROOT_KEY_VERSION: u64 = 1;
+const SIGN_SECRET: &[u8] = b"TOK@@AoNfRIX+3bla%";
+const SIGN_HASH_BLOCK_SIZE: usize = 64;
+const SIGN_HASH_OUTPUT_SIZE: usize = 32;
+
+fn merge_additional_routes(
+    mut routes: Vec<String>,
+    additional_routes: &[String],
+    has_ipv6_address: bool,
+) -> Vec<String> {
+    for route in additional_routes {
+        if !crate::utils::is_valid_cidr(route) {
+            log::warn!("ignoring invalid vpn_additional_routes CIDR: {:?}", route);
+            continue;
+        }
+        if !has_ipv6_address && route.contains(':') {
+            log::info!(
+                "ignoring additional IPv6 route {:?} because the server did not assign an IPv6 address",
+                route
+            );
+            continue;
+        }
+        if !routes.contains(route) {
+            routes.push(route.clone());
+        }
+    }
+    routes
+}
+
+async fn resolve_additional_domains(domains: &[String], has_ipv6_address: bool) -> Vec<String> {
+    let mut routes = Vec::new();
+    for configured_domain in domains {
+        let domain = configured_domain.trim();
+        if domain.is_empty() {
+            log::warn!("ignoring empty vpn_additional_domains entry");
+            continue;
+        }
+
+        match tokio::net::lookup_host((domain, 0)).await {
+            Ok(addresses) => {
+                let mut domain_routes = Vec::new();
+                for address in addresses {
+                    let ip = address.ip();
+                    if ip.is_ipv6() && !has_ipv6_address {
+                        continue;
+                    }
+                    let route = match ip {
+                        std::net::IpAddr::V4(_) => format!("{ip}/32"),
+                        std::net::IpAddr::V6(_) => format!("{ip}/128"),
+                    };
+                    if !domain_routes.contains(&route) {
+                        domain_routes.push(route);
+                    }
+                }
+                if domain_routes.is_empty() {
+                    log::warn!(
+                        "vpn_additional_domains entry {:?} returned no usable addresses",
+                        domain
+                    );
+                } else {
+                    log::info!(
+                        "resolved additional VPN domain {:?} to {:?}",
+                        domain,
+                        domain_routes
+                    );
+                }
+                for route in domain_routes {
+                    if !routes.contains(&route) {
+                        routes.push(route);
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to resolve vpn_additional_domains entry {:?}: {}",
+                    domain,
+                    err
+                );
+            }
+        }
+    }
+    routes
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SIGN_HASH_OUTPUT_SIZE] {
+    let mut key_block = [0u8; SIGN_HASH_BLOCK_SIZE];
+    if key.len() > SIGN_HASH_BLOCK_SIZE {
+        key_block[..SIGN_HASH_OUTPUT_SIZE].copy_from_slice(&sha2::Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; SIGN_HASH_BLOCK_SIZE];
+    let mut opad = [0x5cu8; SIGN_HASH_BLOCK_SIZE];
+    for i in 0..SIGN_HASH_BLOCK_SIZE {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = sha2::Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let zero_salt = [0u8; SIGN_HASH_OUTPUT_SIZE];
+    let prk = if salt.is_empty() {
+        hmac_sha256(&zero_salt, secret)
+    } else {
+        hmac_sha256(salt, secret)
+    };
+
+    let mut okm = Vec::with_capacity(len);
+    let mut previous = Vec::new();
+    let mut counter = 1u8;
+    while okm.len() < len {
+        let mut input = Vec::with_capacity(previous.len() + info.len() + 1);
+        input.extend_from_slice(&previous);
+        input.extend_from_slice(info);
+        input.push(counter);
+        previous = hmac_sha256(&prk, &input).to_vec();
+        okm.extend_from_slice(&previous);
+        counter = counter.wrapping_add(1);
+    }
+    okm.truncate(len);
+    okm
+}
+
+fn write_pb_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_pb_field_varint(field: u64, value: u64, out: &mut Vec<u8>) {
+    write_pb_varint(field << 3, out);
+    write_pb_varint(value, out);
+}
+
+fn write_pb_field_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+    write_pb_varint((field << 3) | 2, out);
+    write_pb_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_sign_header(signing_input_params: u64, signing_result: &[u8]) -> String {
+    let mut body = Vec::with_capacity(40);
+    write_pb_field_varint(1, SIGN_ROOT_KEY_VERSION, &mut body);
+    write_pb_field_varint(3, signing_input_params, &mut body);
+    write_pb_field_bytes(4, signing_result, &mut body);
+
+    use base64::Engine;
+    format!(
+        "v1;{}",
+        base64::engine::general_purpose::STANDARD.encode(body)
+    )
+}
+
+fn corplink_client_builder() -> ClientBuilder {
+    ClientBuilder::new()
+        // CorpLink deployments may use certificates signed by their own CA.
+        .danger_accept_invalid_certs(true)
+        // for debug
+        // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
+        .user_agent(format!(
+            "CorpLink/{CORPLINK_APP_VERSION} (linux; Linux; en)"
+        ))
+        .timeout(Duration::from_millis(10000))
+}
 
 #[derive(Clone)]
 pub struct Client {
     conf: Config,
     cookie: Arc<CookieStoreMutex>,
     c: reqwest::Client,
+    probe_client: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
+}
+
+struct VpnProbeResponse {
+    latency_ms: i64,
+    set_cookie_headers: Vec<header::HeaderValue>,
+}
+
+struct SelectedVpn {
+    vpn: RespVpnInfo,
+    set_cookie_headers: Vec<header::HeaderValue>,
 }
 
 unsafe impl Send for Client {}
@@ -87,12 +276,13 @@ impl Client {
         let mut cookie_store = {
             let file = fs::File::open(&cookie_file).map(io::BufReader::new);
             match file {
-                Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
-                    bail!(
-                        "failed to load cookie store from {}: {e}",
+                Ok(file) => CookieStore::load_json_all(file).unwrap_or_else(|e| {
+                    log::warn!(
+                        "failed to load cookie store from {}, using empty store: {e}",
                         cookie_file.display()
-                    )
-                })?,
+                    );
+                    CookieStore::default()
+                }),
                 Err(_) => CookieStore::default(),
             }
         };
@@ -129,15 +319,14 @@ impl Client {
 
         let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
 
-        let c = ClientBuilder::new()
-            // allow invalid certs because this cert is signed by corplink
-            .danger_accept_invalid_certs(true)
-            // for debug
-            // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
-            .user_agent(USER_AGENT)
+        // Keep probe responses out of the shared cookie store until an endpoint is selected.
+        let probe_client = corplink_client_builder()
+            .default_headers(headers.clone())
+            .build()
+            .context("build VPN probe HTTP client")?;
+        let c = corplink_client_builder()
             .cookie_provider(Arc::clone(&cookie_store))
             .default_headers(headers)
-            .timeout(Duration::from_millis(10000))
             .build()
             .context("build http client")?;
         let conf_bak = conf.clone();
@@ -145,6 +334,7 @@ impl Client {
             conf,
             cookie: Arc::clone(&cookie_store),
             c,
+            probe_client,
             api_url: ApiUrl::new(&conf_bak)?,
             date_offset_sec: 0,
         })
@@ -157,18 +347,33 @@ impl Client {
     }
 
     fn save_cookie(&self) -> Result<()> {
+        let f = self
+            .conf
+            .conf_file
+            .as_ref()
+            .context("config file path missing")?;
         let interface_name = self
             .conf
             .interface_name
             .as_ref()
             .context("interface name missing in config")?;
+        let dir = match path::Path::new(f).parent() {
+            Some(dir) => dir,
+            None => path::Path::new("."),
+        };
+        let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .append(false)
-            .open(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX))
+            .open(&cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| "failed to open cookie file for writing")?;
+            .with_context(|| {
+                format!(
+                    "failed to open cookie file for writing: {}",
+                    cookie_file.display()
+                )
+            })?;
         let c = self
             .cookie
             .lock()
@@ -178,24 +383,155 @@ impl Client {
         Ok(())
     }
 
+    fn cookie_header_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        Ok(ReqwestCookieStore::cookies(self.cookie.as_ref(), url))
+    }
+
+    fn csrf_token_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        self.cookie_value_for_url(url, "csrf-token")
+            .and_then(|value| {
+                value
+                    .map(|value| {
+                        header::HeaderValue::from_str(&value)
+                            .context("invalid csrf-token header value")
+                    })
+                    .transpose()
+            })
+    }
+
+    fn cookie_value_for_url(&self, url: &Url, name: &str) -> Result<Option<String>> {
+        let cookie_store = self
+            .cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
+        let Some(domain) = url.domain().or_else(|| url.host_str()) else {
+            return Ok(None);
+        };
+        Ok(cookie_store
+            .get(domain, "/", name)
+            .map(|cookie| cookie.value().to_string()))
+    }
+
+    fn signing_input_params(api: &ApiName) -> Option<u64> {
+        match api {
+            ApiName::ListVPN => Some(510),
+            ApiName::ConnectVPN => Some(542),
+            _ => None,
+        }
+    }
+
+    fn sign_request(
+        &self,
+        api: &ApiName,
+        method: &str,
+        url: &Url,
+        body: Option<&str>,
+        cookie_header: Option<&header::HeaderValue>,
+        csrf_token: Option<&header::HeaderValue>,
+    ) -> Result<Option<String>> {
+        let Some(signing_input_params) = Self::signing_input_params(api) else {
+            return Ok(None);
+        };
+        let device_id = self
+            .conf
+            .device_id
+            .as_deref()
+            .context("device_id missing in config; required for request signing")?;
+        let info = format!("{}|{}", self.conf.company_name, device_id);
+        let key = hkdf_sha256(SIGN_SECRET, &[], info.as_bytes(), SIGN_HASH_OUTPUT_SIZE);
+
+        let cookie = cookie_header
+            .map(|value| value.to_str().context("invalid Cookie header for signing"))
+            .transpose()?
+            .unwrap_or("");
+        let csrf = csrf_token
+            .map(|value| {
+                value
+                    .to_str()
+                    .context("invalid csrf-token header for signing")
+            })
+            .transpose()?
+            .unwrap_or("");
+        let body_hash = body
+            .filter(|body| !body.is_empty())
+            .map(|body| sha2::Sha256::digest(body.as_bytes()).to_vec())
+            .unwrap_or_default();
+        let vpn_token = if matches!(api, ApiName::ConnectVPN) {
+            self.cookie_value_for_url(url, "vpn-token")?
+                .context("vpn-token cookie missing; required for connect request signing")?
+        } else {
+            String::new()
+        };
+
+        let fields: [&[u8]; 10] = [
+            b"",
+            method.as_bytes(),
+            url.path().as_bytes(),
+            url.query().unwrap_or("").as_bytes(),
+            body_hash.as_slice(),
+            cookie.as_bytes(),
+            b"",
+            csrf.as_bytes(),
+            b"",
+            vpn_token.as_bytes(),
+        ];
+
+        let mut canonical = Vec::new();
+        for (index, value) in fields.iter().enumerate().skip(1) {
+            if (signing_input_params & (1 << index)) != 0 {
+                canonical.extend_from_slice(value);
+            }
+        }
+
+        let signing_result = hmac_sha256(&key, &canonical);
+        Ok(Some(encode_sign_header(
+            signing_input_params,
+            &signing_result,
+        )))
+    }
+
     async fn request<T: DeserializeOwned + fmt::Debug>(
         &mut self,
         api: ApiName,
         body: Option<Map<String, Value>>,
     ) -> Result<Resp<T>> {
         let url = self.api_url.get_api_url(&api);
+        let parsed_url = Url::from_str(&url).with_context(|| format!("invalid url for {api:?}"))?;
+        let body = body
+            .map(|body| {
+                serde_json::to_string(&body)
+                    .with_context(|| format!("failed to serialize request body for {api:?}"))
+            })
+            .transpose()?;
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let cookie_header = self.cookie_header_for_url(&parsed_url)?;
+        let csrf_token = self.csrf_token_for_url(&parsed_url)?;
+        let sign_header = self.sign_request(
+            &api,
+            method,
+            &parsed_url,
+            body.as_deref(),
+            cookie_header.as_ref(),
+            csrf_token.as_ref(),
+        )?;
 
-        let rb = match body {
-            Some(body) => {
-                let body = serde_json::to_string(&body)
-                    .with_context(|| format!("failed to serialize request body for {api:?}"))?;
-                self.c
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(body)
-            }
+        let mut rb = match body {
+            Some(body) => self
+                .c
+                .post(url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body),
             None => self.c.get(url),
         };
+        if let Some(cookie_header) = cookie_header {
+            rb = rb.header(header::COOKIE, cookie_header);
+        }
+        if let Some(csrf_token) = csrf_token {
+            rb = rb.header("csrf-token", csrf_token);
+        }
+        if let Some(sign_header) = sign_header {
+            rb = rb.header("sign", sign_header);
+        }
 
         let resp = rb
             .send()
@@ -314,8 +650,17 @@ impl Client {
     ) -> Result<String> {
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
+<<<<<<< HEAD
         // Skip terminal QR for now; SSO URLs are long and clutter the console.
         // Open the link above in a browser or paste it into Feishu to scan.
+=======
+        match TerminalQrCode::from_bytes(url.as_bytes()) {
+            Ok(qr) => qr.print(),
+            Err(e) => {
+                log::warn!("failed to generate qr code: {e}");
+            }
+        }
+>>>>>>> pr-99-signature
         match method {
             PLATFORM_LARK | PLATFORM_OIDC | PLATFORM_BYTEDANCE_SSO => {
                 log::info!("press enter if you finish auth");
@@ -705,97 +1050,204 @@ impl Client {
         }
     }
 
-    async fn get_first_vpn_by_latency(
-        &mut self,
-        vpn_info: Vec<RespVpnInfo>,
-    ) -> Option<RespVpnInfo> {
-        let mut fast_vpn = None;
-        let mut min_latency = i64::MAX;
-        for vpn in vpn_info {
-            let latency = match self.ping_vpn(vpn.ip.clone(), vpn.api_port).await {
-                Ok(latency) => latency,
+    async fn get_first_vpn_by_latency(&self, vpn_info: Vec<RespVpnInfo>) -> Option<SelectedVpn> {
+        let mut fastest: Option<(i64, usize, SelectedVpn)> = None;
+
+        let mut probes = vpn_info
+            .into_iter()
+            .enumerate()
+            .map(|(index, vpn)| async move {
+                let result = self.ping_vpn(&vpn.ip, vpn.api_port).await;
+                (index, vpn, result)
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some((index, vpn, result)) = probes.next().await {
+            match result {
+                Ok(response) => {
+                    log::info!(
+                        "server name {}, latency {}ms",
+                        vpn.en_name,
+                        response.latency_ms
+                    );
+                    let should_replace = match &fastest {
+                        Some((latency, best_index, _)) => {
+                            (response.latency_ms, index) < (*latency, *best_index)
+                        }
+                        None => true,
+                    };
+                    if should_replace {
+                        fastest = Some((
+                            response.latency_ms,
+                            index,
+                            SelectedVpn {
+                                vpn,
+                                set_cookie_headers: response.set_cookie_headers,
+                            },
+                        ));
+                    }
+                }
                 Err(err) => {
                     log::warn!("failed to ping {}:{}: {}", vpn.ip, vpn.api_port, err);
-                    -1
                 }
-            };
-
-            log::info!(
-                "server name {}{}",
-                vpn.en_name,
-                match latency {
-                    -1 => " timeout".to_string(),
-                    _ => format!(", latency {}ms", latency),
-                }
-            );
-            if latency != -1 && latency < min_latency {
-                fast_vpn = Some(vpn);
-                min_latency = latency;
             }
         }
-        fast_vpn
+        fastest.map(|(_, _, vpn)| vpn)
     }
 
-    async fn get_first_available_vpn(&mut self, vpn_info: Vec<RespVpnInfo>) -> Option<RespVpnInfo> {
-        for vpn in vpn_info {
-            let latency = match self.ping_vpn(vpn.ip.clone(), vpn.api_port).await {
-                Ok(latency) => latency,
-                Err(err) => {
-                    log::warn!("failed to ping {}:{}: {}", vpn.ip, vpn.api_port, err);
-                    -1
+    async fn get_first_available_vpn(&self, vpn_info: Vec<RespVpnInfo>) -> Option<SelectedVpn> {
+        // Probes finish out of order, but the default strategy follows server-list priority.
+        let mut results = std::iter::repeat_with(|| None)
+            .take(vpn_info.len())
+            .collect::<Vec<_>>();
+        let mut next_index = 0;
+        let mut probes = vpn_info
+            .into_iter()
+            .enumerate()
+            .map(|(index, vpn)| async move {
+                let result = self.ping_vpn(&vpn.ip, vpn.api_port).await;
+                (index, vpn, result)
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some((index, vpn, result)) = probes.next().await {
+            results[index] = Some((vpn, result));
+
+            while next_index < results.len() {
+                let Some((vpn, result)) = results[next_index].take() else {
+                    break;
+                };
+                next_index += 1;
+
+                match result {
+                    Ok(response) => {
+                        log::info!(
+                            "server name {}, latency {}ms",
+                            vpn.en_name,
+                            response.latency_ms
+                        );
+                        return Some(SelectedVpn {
+                            vpn,
+                            set_cookie_headers: response.set_cookie_headers,
+                        });
+                    }
+                    Err(err) => {
+                        log::warn!("failed to ping {}:{}: {}", vpn.ip, vpn.api_port, err);
+                    }
                 }
-            };
-            if latency != -1 {
-                return Some(vpn);
             }
         }
         None
     }
 
-    // ping vpn and return latency in ms. Will return Err on error
-    async fn ping_vpn(&mut self, ip: String, api_port: u16) -> Result<i64> {
-        {
-            // config cookie
-            let mut cookie = self
-                .cookie
-                .lock()
-                .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
-            let server_url = self
-                .conf
-                .server
-                .as_ref()
-                .context("server url is required to ping vpn")?;
-
-            let mut url = Url::from_str(server_url)
-                .with_context(|| format!("invalid server url: {server_url}"))?;
-            let mut cookies: Vec<Cookie> = Vec::new();
-            for c in cookie.iter_any() {
-                if c.domain.matches(&url.clone()) {
-                    cookies.push(c.clone());
-                }
-            }
-            url.set_host(Some(ip.as_str()))
-                .context("failed to set ping host")?;
-            url.set_port(Some(api_port))
-                .or_else(|_| bail!("failed to set ping port"))?;
-            for c in cookies {
-                let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
-                c.set_domain(ip.clone());
-                let c = Cookie::try_from_raw_cookie(&c, &url.clone())
-                    .context("failed to convert raw cookie")?;
-                cookie
-                    .insert(c, &url.clone())
-                    .context("failed to insert ping cookie")?;
-            }
-            self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
+    fn vpn_endpoint_url(&self, host: &str, api_port: u16) -> Result<Url> {
+        let server_url = self
+            .conf
+            .server
+            .as_ref()
+            .context("server url is required to configure vpn endpoint")?;
+        let server_url = Url::from_str(server_url)
+            .with_context(|| format!("invalid server url: {server_url}"))?;
+        let mut endpoint_url = Url::parse(&format!("{}://localhost", server_url.scheme()))
+            .context("failed to construct vpn endpoint URL")?;
+        match host.parse::<IpAddr>() {
+            Ok(ip) => endpoint_url
+                .set_ip_host(ip)
+                .map_err(|_| anyhow!("failed to set vpn endpoint IP"))?,
+            Err(_) => endpoint_url
+                .set_host(Some(host))
+                .context("failed to set vpn endpoint host")?,
         }
-        self.save_cookie()?;
-        let req_start = Utc::now().timestamp_millis();
-        let resp = self.request::<String>(ApiName::PingVPN, None).await?;
-        let req_end = Utc::now().timestamp_millis();
-        let latency = req_end - req_start;
+        endpoint_url
+            .set_port(Some(api_port))
+            .map_err(|_| anyhow!("failed to set vpn endpoint port"))?;
+        Ok(endpoint_url)
+    }
+
+    fn probe_cookie_header(&self) -> Result<Option<header::HeaderValue>> {
+        let server_url = self
+            .conf
+            .server
+            .as_ref()
+            .context("server url is required to prepare VPN probe cookies")?;
+        let server_url = Url::from_str(server_url)
+            .with_context(|| format!("invalid server url: {server_url}"))?;
+        Ok(ReqwestCookieStore::cookies(
+            self.cookie.as_ref(),
+            &server_url,
+        ))
+    }
+
+    fn prepare_vpn_endpoint(&mut self, ip: &str, api_port: u16) -> Result<Url> {
+        let url = self.vpn_endpoint_url(ip, api_port)?;
+        let mut cookie_store = self
+            .cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
+        let server_url = self
+            .conf
+            .server
+            .as_ref()
+            .context("server url is required to configure vpn endpoint")?;
+
+        let server_url = Url::from_str(server_url)
+            .with_context(|| format!("invalid server url: {server_url}"))?;
+        let cookies: Vec<Cookie> = cookie_store
+            .iter_any()
+            .filter(|cookie| !cookie.is_expired() && cookie.domain.matches(&server_url))
+            .cloned()
+            .collect();
+        for cookie in cookies {
+            let raw_cookie =
+                cookie::Cookie::new(cookie.name().to_string(), cookie.value().to_string());
+            let endpoint_cookie = Cookie::try_from_raw_cookie(&raw_cookie, &url)
+                .context("failed to convert raw cookie")?;
+            cookie_store
+                .insert(endpoint_cookie, &url)
+                .context("failed to insert vpn endpoint cookie")?;
+        }
+        self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
+        Ok(url)
+    }
+
+    // ping vpn and return latency in ms. Will return Err on error
+    async fn ping_vpn(&self, ip: &str, api_port: u16) -> Result<VpnProbeResponse> {
+        let endpoint_url = self.vpn_endpoint_url(ip, api_port)?;
+        let mut api_url = self.api_url.clone();
+        api_url.vpn_param.url = endpoint_url.to_string().trim_end_matches('/').to_string();
+
+        let mut request = self
+            .probe_client
+            .get(api_url.get_api_url(&ApiName::PingVPN));
+        if let Some(cookies) = self.probe_cookie_header()? {
+            request = request.header(header::COOKIE, cookies);
+        }
+
+        let started = Instant::now();
+        let response = request.send().await.context("VPN probe request failed")?;
+        let status = response.status();
+        let set_cookie_headers = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .cloned()
+            .collect();
+        let body = response
+            .text()
+            .await
+            .context("failed to read VPN probe response body")?;
+        let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+
+        if !status.is_success() {
+            bail!("VPN probe returned HTTP status {status}");
+        }
+        let resp: Resp<Value> = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse VPN probe response: {body}"))?;
         match resp.code {
-            0 => Ok(latency),
+            0 => Ok(VpnProbeResponse {
+                latency_ms,
+                set_cookie_headers,
+            }),
             _ => bail!(format!(
                 "failed to ping vpn with error {}: {}",
                 resp.code,
@@ -906,11 +1358,20 @@ impl Client {
             None => self.get_first_available_vpn(filtered_vpn).await,
         };
 
-        let vpn = match vpn {
-            Some(ref vpn) => vpn,
-            None => bail!("no vpn available"),
+        let selected_vpn = vpn.context("no vpn available")?;
+        let vpn = &selected_vpn.vpn;
+        let endpoint_url = self.prepare_vpn_endpoint(&vpn.ip, vpn.api_port)?;
+        // Persist only cookies returned by the selected endpoint probe.
+        ReqwestCookieStore::set_cookies(
+            self.cookie.as_ref(),
+            &mut selected_vpn.set_cookie_headers.iter(),
+            &endpoint_url,
+        );
+        self.save_cookie()?;
+        let vpn_addr = match vpn.ip.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
+            Err(_) => format!("{}:{}", vpn.ip, vpn.vpn_port),
         };
-        let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
         log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
 
         let key = self
@@ -938,17 +1399,24 @@ impl Client {
             .clone();
         let ip_mask = wg_info.ip_mask.parse::<u32>().context("invalid ip mask")?;
         let address = format!("{}/{}", wg_info.ip, ip_mask);
-        let address6 = (!wg_info.ipv6.is_empty())
+        let has_ipv6_address = !wg_info.ipv6.is_empty();
+        let address6 = has_ipv6_address
             .then_some(format!("{}/128", wg_info.ipv6))
-            .unwrap_or("".into());
+            .unwrap_or_default();
         let mut allowed_ips = match self.conf.route_mode.clone().unwrap_or_default() {
             crate::config::RouteMode::Split => {
                 log::info!("route_mode = split");
-                [
-                    wg_info.setting.vpn_route_split,
-                    wg_info.setting.v6_route_split.unwrap_or_default(),
-                ]
-                .concat()
+                let mut routes = wg_info.setting.vpn_route_split;
+                let v6 = wg_info.setting.v6_route_split.unwrap_or_default();
+                if has_ipv6_address {
+                    routes.extend(v6);
+                } else if !v6.is_empty() {
+                    log::info!(
+                        "ignoring {} IPv6 split routes because the server did not assign an IPv6 address",
+                        v6.len()
+                    );
+                }
+                routes
             }
             crate::config::RouteMode::Full => {
                 log::info!("route_mode = full");
@@ -964,43 +1432,62 @@ impl Client {
                     v6.len(),
                     v6
                 );
-                if v4.is_empty() && v6.is_empty() {
+                let mut routes = v4;
+                if has_ipv6_address {
+                    routes.extend(v6);
+                } else if !v6.is_empty() {
+                    log::info!(
+                        "ignoring {} IPv6 full-tunnel routes because the server did not assign an IPv6 address",
+                        v6.len()
+                    );
+                }
+                if routes.is_empty() {
                     bail!(
-                        "route_mode=full but server returned no routes (vpn_route_full / v6_route_full both empty); \
+                        "route_mode=full but server returned no usable routes; \
                          refuse to fall back to 0.0.0.0/0 to avoid peer-IP routing loop that blocks all traffic"
                     );
                 }
-                [v4, v6].concat()
+                routes
             }
         };
 
-        // Carve user-specified CIDRs out of allowed_ips. This removes any IPs in
-        // vpn_disallowed_routes from the VPN's AllowedIPs (and the system routes
-        // derived from them), which is the standard way to avoid routing loops in
-        // full-tunnel mode — e.g. listing the local LAN or a CIDR covering the
-        // VPN peer endpoint so their packets don't get captured by the tunnel.
-        //
-        // Semantics: CIDR subtraction. An entry like "10.68.0.0/16" carves that
-        // whole range out of each allowed_ip, even when allowed_ip is a larger
-        // supernet such as "0.0.0.0/0" — which expands to a minimal set of
-        // smaller CIDRs covering "allowed minus disallowed".
-        if let Some(disallowed) = self.conf.vpn_disallowed_routes.as_ref() {
-            if !disallowed.is_empty() {
-                let before = allowed_ips.len();
-                for d in disallowed {
-                    let mut carved = Vec::with_capacity(allowed_ips.len());
-                    for a in &allowed_ips {
-                        carved.extend(crate::utils::subtract_cidr_from_cidr(a, d));
-                    }
-                    allowed_ips = carved;
+        let mut additional_routes = self.conf.vpn_additional_routes.clone().unwrap_or_default();
+        if let Some(domains) = self.conf.vpn_additional_domains.as_deref() {
+            additional_routes.extend(resolve_additional_domains(domains, has_ipv6_address).await);
+        }
+        if !additional_routes.is_empty() {
+            let before = allowed_ips.len();
+            allowed_ips =
+                merge_additional_routes(allowed_ips, &additional_routes, has_ipv6_address);
+            log::info!(
+                "additional VPN routes merged: {} -> {} entries",
+                before,
+                allowed_ips.len()
+            );
+        }
+
+        // Restrict server and user-added routes to the optional whitelist, then
+        // carve out the optional denylist. A configured empty whitelist
+        // intentionally yields no AllowedIPs/routes; invalid entries fail closed.
+        if let Some(allowed) = self.conf.vpn_allowed_routes.as_deref() {
+            for route in allowed {
+                if !crate::utils::is_valid_cidr(route) {
+                    log::warn!("ignoring invalid vpn_allowed_routes CIDR: {:?}", route);
                 }
-                log::info!(
-                    "vpn_disallowed_routes applied: {} -> {} entries (carved: {:?})",
-                    before,
-                    allowed_ips.len(),
-                    disallowed
-                );
             }
+        }
+        let before = allowed_ips.len();
+        allowed_ips = crate::utils::apply_route_filters(
+            &allowed_ips,
+            self.conf.vpn_allowed_routes.as_deref(),
+            self.conf.vpn_disallowed_routes.as_deref(),
+        );
+        if self.conf.vpn_allowed_routes.is_some() || self.conf.vpn_disallowed_routes.is_some() {
+            log::info!(
+                "VPN route filters applied: {} -> {} entries",
+                before,
+                allowed_ips.len()
+            );
         }
 
         // Auto-carve the VPN peer endpoint IP out of allowed_ips. In full-tunnel mode
@@ -1176,5 +1663,291 @@ impl Client {
         let resp = req.send().await.context("logout request failed")?;
         log::info!("logout (current terminal) status: {}", resp.status());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{oneshot, Barrier};
+    use tokio::time::{sleep, timeout};
+
+    use super::{
+        encode_sign_header, hkdf_sha256, merge_additional_routes, resolve_additional_domains,
+        Client, ReqwestCookieStore,
+    };
+    use crate::config::Config;
+    use crate::resp::RespVpnInfo;
+    use crate::utils::apply_route_filters;
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_case_1() {
+        let ikm = vec![0x0b; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm = hkdf_sha256(&ikm, &salt, &info, 42);
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a\
+             2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+             34007208d5b887185865"
+                .replace(char::is_whitespace, "")
+        );
+    }
+
+    #[test]
+    fn sign_header_uses_observed_wire_shape() {
+        let header = encode_sign_header(510, &[0x11; 32]);
+        assert!(header.starts_with("v1;"));
+        let encoded = header.trim_start_matches("v1;");
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            hex::encode(bytes),
+            format!("080118fe032220{}", "11".repeat(32))
+        );
+    }
+
+    async fn start_probe_server(
+        barrier: Arc<Barrier>,
+        response_delay: Duration,
+        session: &'static str,
+    ) -> (u16, oneshot::Receiver<String>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+
+            barrier.wait().await;
+            sleep(response_delay).await;
+            let body = r#"{"code":0}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: vpn_session={session}; Path=/\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (port, request_rx, task)
+    }
+
+    fn vpn_info(port: u16, name: &str) -> RespVpnInfo {
+        RespVpnInfo {
+            api_port: port,
+            vpn_port: port,
+            ip: "127.0.0.1".to_string(),
+            protocol_mode: 2,
+            name: name.to_string(),
+            en_name: name.to_string(),
+            icon: String::new(),
+            id: 0,
+            timeout: 0,
+        }
+    }
+
+    fn test_client() -> Client {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": "http://127.0.0.1",
+            "interface_name": format!("corplink-probe-test-{unique}"),
+            "device_id": "test-device"
+        }))
+        .unwrap();
+        conf.conf_file = Some(
+            std::env::temp_dir()
+                .join(format!("corplink-probe-test-{unique}.json"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        Client::new(conf).unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_default_probe_preserves_order_and_isolates_cookie_state() {
+        let barrier = Arc::new(Barrier::new(3));
+        let (first_port, first_request, first_task) =
+            start_probe_server(Arc::clone(&barrier), Duration::from_millis(75), "first").await;
+        let (second_port, second_request, second_task) =
+            start_probe_server(Arc::clone(&barrier), Duration::ZERO, "second").await;
+
+        let client = test_client();
+        let candidates = vec![
+            vpn_info(first_port, "first"),
+            vpn_info(second_port, "second"),
+        ];
+
+        let selected = timeout(Duration::from_secs(5), async {
+            let (selected, _) =
+                tokio::join!(client.get_first_available_vpn(candidates), barrier.wait());
+            selected
+        })
+        .await
+        .expect("VPN probes did not run concurrently")
+        .expect("no VPN was selected");
+
+        assert_eq!(selected.vpn.en_name, "first");
+        assert!(selected.set_cookie_headers[0]
+            .to_str()
+            .unwrap()
+            .starts_with("vpn_session=first"));
+        let first_request = first_request.await.unwrap().to_ascii_lowercase();
+        let second_request = second_request.await.unwrap().to_ascii_lowercase();
+        assert!(first_request.contains("cookie: device_id=test-device"));
+        assert!(second_request.contains("cookie: device_id=test-device"));
+        assert!(first_request.contains("user-agent: corplink/3.3.17 "));
+        assert!(second_request.contains("user-agent: corplink/3.3.17 "));
+
+        {
+            let cookie_store = client.cookie.lock().unwrap();
+            assert!(cookie_store.get("127.0.0.1", "/", "vpn_session").is_none());
+        }
+        let endpoint_url = client
+            .vpn_endpoint_url(&selected.vpn.ip, selected.vpn.api_port)
+            .unwrap();
+        ReqwestCookieStore::set_cookies(
+            client.cookie.as_ref(),
+            &mut selected.set_cookie_headers.iter(),
+            &endpoint_url,
+        );
+        {
+            let cookie_store = client.cookie.lock().unwrap();
+            assert_eq!(
+                cookie_store
+                    .get("127.0.0.1", "/", "vpn_session")
+                    .unwrap()
+                    .value(),
+                "first"
+            );
+        }
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_latency_probe_selects_the_fastest_endpoint() {
+        let barrier = Arc::new(Barrier::new(3));
+        let (slow_port, slow_request, slow_task) =
+            start_probe_server(Arc::clone(&barrier), Duration::from_millis(75), "slow").await;
+        let (fast_port, fast_request, fast_task) =
+            start_probe_server(Arc::clone(&barrier), Duration::ZERO, "fast").await;
+        let client = test_client();
+        let candidates = vec![vpn_info(slow_port, "slow"), vpn_info(fast_port, "fast")];
+
+        let selected = timeout(Duration::from_secs(5), async {
+            let (selected, _) =
+                tokio::join!(client.get_first_vpn_by_latency(candidates), barrier.wait());
+            selected
+        })
+        .await
+        .expect("VPN probes did not run concurrently")
+        .expect("no VPN was selected");
+
+        assert_eq!(selected.vpn.en_name, "fast");
+        assert!(selected.set_cookie_headers[0]
+            .to_str()
+            .unwrap()
+            .starts_with("vpn_session=fast"));
+        slow_request.await.unwrap();
+        fast_request.await.unwrap();
+        slow_task.await.unwrap();
+        fast_task.await.unwrap();
+    }
+
+    #[test]
+    fn vpn_endpoint_urls_use_server_scheme_and_candidate_host() {
+        let mut client = test_client();
+        client.conf.server = Some("https://127.0.0.1/base?source=config#fragment".to_string());
+
+        let hostname_endpoint = client
+            .vpn_endpoint_url("vpn-node.example.com", 8443)
+            .unwrap();
+        let ipv4_endpoint = client.vpn_endpoint_url("192.0.2.1", 8443).unwrap();
+        let ipv6_endpoint = client.prepare_vpn_endpoint("2001:db8::1", 8443).unwrap();
+        let ipv6_cookies = ReqwestCookieStore::cookies(client.cookie.as_ref(), &ipv6_endpoint)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            hostname_endpoint.as_str(),
+            "https://vpn-node.example.com:8443/"
+        );
+        assert_eq!(ipv4_endpoint.as_str(), "https://192.0.2.1:8443/");
+        assert_eq!(ipv6_endpoint.as_str(), "https://[2001:db8::1]:8443/");
+        assert!(ipv6_cookies.contains("device_id=test-device"));
+    }
+
+    #[test]
+    fn additional_routes_are_validated_deduplicated_and_merged() {
+        let routes = merge_additional_routes(
+            vec!["10.0.0.0/8".to_string()],
+            &[
+                "10.0.0.0/8".to_string(),
+                "20.205.243.160/28".to_string(),
+                "invalid".to_string(),
+                "2001:db8::/32".to_string(),
+            ],
+            false,
+        );
+
+        assert_eq!(routes, vec!["10.0.0.0/8", "20.205.243.160/28"]);
+    }
+
+    #[test]
+    fn additional_ipv6_routes_are_kept_with_an_ipv6_address() {
+        let routes = merge_additional_routes(Vec::new(), &["2001:db8::/32".to_string()], true);
+
+        assert_eq!(routes, vec!["2001:db8::/32"]);
+    }
+
+    #[test]
+    fn additional_routes_are_merged_before_route_filters() {
+        let routes = merge_additional_routes(
+            vec!["10.0.0.0/8".to_string()],
+            &["20.205.243.160/28".to_string()],
+            false,
+        );
+        let allowed = ["20.205.243.160/28".to_string()];
+
+        assert_eq!(
+            apply_route_filters(&routes, Some(&allowed), None),
+            vec!["20.205.243.160/28"]
+        );
+    }
+
+    #[tokio::test]
+    async fn additional_domains_are_resolved_to_host_routes() {
+        let routes = resolve_additional_domains(&["127.0.0.1".to_string()], false).await;
+
+        assert_eq!(routes, vec!["127.0.0.1/32"]);
     }
 }
