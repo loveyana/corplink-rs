@@ -88,6 +88,13 @@ struct MenuBarView: View {
                 .disabled(controller.isBusy)
         }
 
+        if controller.pendingApply {
+            Text(controller.pendingApplyHint.isEmpty
+                 ? "配置已改，需重连生效"
+                 : controller.pendingApplyHint)
+                .foregroundStyle(.orange)
+        }
+
         Divider()
 
         Button("Open Window…") { showMainWindow() }

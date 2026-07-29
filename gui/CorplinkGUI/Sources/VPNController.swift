@@ -36,6 +36,10 @@ final class VPNController: ObservableObject {
     @Published var lastError: String?
     @Published var otpCode: String = ""
     @Published var otpExpiresIn: Int = 0
+    /// True when mode/node was changed while connected; tunnel still uses old settings.
+    @Published var pendingApply = false
+    /// Short Chinese hint for the pending-apply banner.
+    @Published var pendingApplyHint = ""
 
     let repoRoot: URL
     let binaryPath: String
@@ -254,6 +258,7 @@ final class VPNController: ObservableObject {
                     self.isConnected = false
                     self.tunnelIP = nil
                     self.activeNode = nil
+                    self.clearPendingApply()
                     self.statusText = "Disconnected"
                     self.pendingSSOURL = nil
                     self.awaitingConfirm = false
@@ -269,17 +274,20 @@ final class VPNController: ObservableObject {
         }
     }
 
-    /// Explicit reconnect with current node selection (never auto-triggered by picker).
+    /// Explicit reconnect with current node/mode selection (never auto-triggered by window picker).
     func applyNodeAndReconnect() {
         applyNodeSelection(selectedNode)
+        applyRouteMode(routeMode, announce: false)
         guard isConnected || Self.launchdJobExists(label) else {
-            statusText = "Node saved. Click Connect when ready."
+            clearPendingApply()
+            statusText = "Saved. Click Connect when ready."
             return
         }
         guard !isStarting else { return }
         lastError = nil
         isStarting = true
-        statusText = "Switching node (admin password)…"
+        clearPendingApply()
+        statusText = "Applying changes (admin password)…"
         pendingSSOURL = nil
         awaitingConfirm = false
         lastSeenSSOURL = nil
@@ -300,7 +308,9 @@ final class VPNController: ObservableObject {
                 await MainActor.run {
                     self.isStarting = false
                     self.lastError = error.localizedDescription
-                    self.statusText = "Switch failed / cancelled"
+                    self.statusText = "Apply failed / cancelled"
+                    // Config is already written; keep prompting to retry.
+                    self.markPendingApply(hint: "上次重连失败，可再点「Apply 重连」")
                 }
             }
         }
@@ -309,6 +319,7 @@ final class VPNController: ObservableObject {
     func saveNodeSelectionOnly() {
         guard !suppressNodeWrite else { return }
         applyNodeSelection(selectedNode)
+        announceConfigChange(kind: "节点", detail: displayName(for: selectedNode))
     }
 
     func applyCustomNode() {
@@ -324,15 +335,40 @@ final class VPNController: ObservableObject {
         suppressNodeWrite = false
         applyNodeSelection(name)
         customNode = ""
-        statusText = "Node set to \(name). Connect or Apply & Reconnect."
+        announceConfigChange(kind: "节点", detail: name)
     }
 
-    func applyRouteMode(_ mode: RouteMode) {
+    func applyRouteMode(_ mode: RouteMode, announce: Bool = true) {
         do {
             try Self.setJSONString(in: configPath, key: "route_mode", value: mode.rawValue)
+            if announce {
+                let label = mode == .split ? "极速 (split)" : "全局 (full)"
+                announceConfigChange(kind: "模式", detail: label)
+            }
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// Window pickers only write config; live tunnel needs an explicit reconnect.
+    private func announceConfigChange(kind: String, detail: String) {
+        if isConnected || Self.launchdJobExists(label) {
+            markPendingApply(hint: "\(kind)已改为 \(detail)，需重连后才会生效")
+            statusText = "已保存 · 点「Apply 重连」生效"
+        } else {
+            clearPendingApply()
+            statusText = "\(kind)已保存 · 下次 Connect 生效"
+        }
+    }
+
+    private func markPendingApply(hint: String) {
+        pendingApply = true
+        pendingApplyHint = hint
+    }
+
+    private func clearPendingApply() {
+        pendingApply = false
+        pendingApplyHint = ""
     }
 
     func applyNodeSelection(_ choice: String) {
@@ -387,9 +423,12 @@ final class VPNController: ObservableObject {
     }
 
     /// Menu-bar mode switch: save config; reconnect if already connected.
+    /// Menu-bar mode switch: save config; reconnect immediately if already connected.
     func selectModeFromMenu(_ mode: RouteMode) {
+        suppressNodeWrite = true
         routeMode = mode
-        applyRouteMode(mode)
+        suppressNodeWrite = false
+        applyRouteMode(mode, announce: false)
         if isConnected {
             applyNodeAndReconnect()
         } else {
@@ -397,7 +436,7 @@ final class VPNController: ObservableObject {
         }
     }
 
-    /// Menu-bar node switch: save config; reconnect if already connected.
+    /// Menu-bar node switch: save config; reconnect immediately if already connected.
     func selectNodeFromMenu(_ node: String) {
         suppressNodeWrite = true
         selectedNode = node
@@ -462,20 +501,30 @@ final class VPNController: ObservableObject {
         isConnected = (ip != nil)
         tunnelIP = ip
         if isConnected {
-            if let activeNode, !activeNode.isEmpty {
-                statusText = "Connected · \(activeNode)"
-            } else {
-                statusText = "Connected"
+            // Do not clear isStarting here — reconnect may still be stopping the tunnel
+            // while the old IP is briefly still present.
+            if !isStarting {
+                if pendingApply {
+                    statusText = "已保存 · 点「Apply 重连」生效"
+                } else if let activeNode, !activeNode.isEmpty {
+                    statusText = "Connected · \(activeNode)"
+                    awaitingConfirm = false
+                    pendingSSOURL = nil
+                } else {
+                    statusText = "Connected"
+                    awaitingConfirm = false
+                    pendingSSOURL = nil
+                }
             }
-            isStarting = false
-            awaitingConfirm = false
-            pendingSSOURL = nil
         } else if Self.launchdJobExists(label) {
             if !isStarting {
                 statusText = "Connecting / authenticating…"
             }
         } else if !isStarting {
-            statusText = "Disconnected"
+            if pendingApply { clearPendingApply() }
+            if !statusText.contains("已保存") {
+                statusText = "Disconnected"
+            }
         }
     }
 

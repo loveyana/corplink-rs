@@ -111,6 +111,9 @@ struct ContentView: View {
     }
 
     private var subtitle: String {
+        if controller.pendingApply, controller.isConnected {
+            return "待重连生效"
+        }
         if let node = controller.activeNode, controller.isConnected {
             return "Connected · \(node)"
         }
@@ -238,6 +241,10 @@ struct ContentView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(Color.white.opacity(0.38))
 
+                if controller.pendingApply {
+                    pendingApplyBanner
+                }
+
                 Divider().overlay(CLTheme.hairline).padding(.vertical, 2)
 
                 HStack(spacing: 8) {
@@ -245,10 +252,14 @@ struct ContentView: View {
                         if controller.isConnected { controller.disconnect() }
                         else { controller.connect() }
                     }
-                    .buttonStyle(CLPrimaryButtonStyle(enabled: !controller.isBusy))
+                    .buttonStyle(CLPrimaryButtonStyle(enabled: !controller.isBusy && !controller.pendingApply))
                     .disabled(controller.isBusy)
 
-                    if controller.isConnected {
+                    if controller.pendingApply {
+                        Button("Apply 重连") { controller.applyNodeAndReconnect() }
+                            .buttonStyle(CLPrimaryButtonStyle(enabled: !controller.isBusy))
+                            .disabled(controller.isBusy)
+                    } else if controller.isConnected {
                         Button("Reconnect") { controller.applyNodeAndReconnect() }
                             .buttonStyle(CLGhostButtonStyle())
                             .disabled(controller.isBusy)
@@ -298,6 +309,37 @@ struct ContentView: View {
             .font(.system(size: 9, weight: .bold, design: .rounded))
             .tracking(1.1)
             .foregroundStyle(Color.white.opacity(0.32))
+    }
+
+    private var pendingApplyBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(CLTheme.warn)
+                .frame(width: 7, height: 7)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("配置已保存，当前连接尚未切换")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CLTheme.warn)
+                Text(controller.pendingApplyHint.isEmpty
+                     ? "点下方「Apply 重连」后生效（需管理员密码）"
+                     : controller.pendingApplyHint)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.white.opacity(0.55))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(CLTheme.warn.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(CLTheme.warn.opacity(0.35), lineWidth: 1)
+                )
+        )
+        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
     private var otpDisplayText: String {
