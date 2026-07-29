@@ -165,7 +165,7 @@ CorpLink/{CORPLINK_APP_VERSION} (linux; Linux; en)
 
 ## Signature generation flowchart
 
-How `sign_request` builds the `sign` header (no commas in labels — GitHub Mermaid is picky):
+How `sign_request` builds the `sign` header:
 
 ```mermaid
 flowchart TD
@@ -185,7 +185,7 @@ flowchart TD
     L{More bits?} -->|yes| I
     L -->|no| M[HMAC-SHA256 key over canonical]
     M --> N[Protobuf version + params + hmac]
-    N --> O[sign = v1; Base64 protobuf]
+    N --> O[sign header = v1 plus Base64 protobuf]
     O --> P[Attach HTTP header and send request]
 ```
 
@@ -214,9 +214,9 @@ sequenceDiagram
     C->>S: session cookies and csrf-token
 
     Note over C: ListVPN signed params=510
-    C->>C: key = HKDF secret with company|device_id
+    C->>C: key = HKDF secret with company and device_id
     C->>C: canonical = selected fields
-    C->>C: sign = v1;b64 protobuf version=1 params=510 hmac
+    C->>C: sign header = v1 plus b64 protobuf
     C->>S: GET /api/vpn/list + Cookie + sign
     S-->>C: VPN node list
 
