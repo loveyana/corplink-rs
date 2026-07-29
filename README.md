@@ -2,24 +2,46 @@
 
 使用 rust 实现的 [飞连][1] 客户端，支持 Linux/Windows10/MacOS
 
+本仓库（fork）额外提供：
+
+- **macOS GUI（CorplinkGUI）**：菜单栏 + 主窗口，连接/断开、模式与节点切换、SSO 分步确认、节点延迟探测
+- **飞连 OTP**：`corplink-otp` CLI（Keychain）+ GUI 内实时展示 / 复制 / **全局快捷键**
+
+<p align="center">
+  <img src="docs/images/gui-window.png" alt="CorpLink RS GUI" width="420" />
+</p>
+
 # 安装
 
-## ArchLinux
+## 预编译包
 
-下载 [release](https://github.com/PinkD/corplink-rs/releases) 中的安装包，并安装
+本 fork：[Releases](https://github.com/loveyana/corplink-rs/releases)（含 macOS GUI）  
+上游原版：<https://github.com/PinkD/corplink-rs/releases>
+
+### ArchLinux
 
 ```bash
-pacman -U corplink-rs-4.1-1-x86_64.pkg.tar.zst
+pacman -U corplink-rs-5.7-1-x86_64.pkg.tar.zst
 ```
 
 > 欢迎贡献其它包管理器的打包脚本
+
+### macOS（含 GUI）
+
+```bash
+tar -xzf corplink-rs-5.7-macos-arm64.tar.gz
+cd corplink-rs-5.7-macos-arm64
+# edit config.json, then:
+open CorplinkGUI.app
+# or: sudo ./corplink-rs ./config.json
+```
 
 ## 手动编译
 
 ### linux/macos
 
 ```bash
-git clone https://github.com/PinkD/corplink-rs --depth 1
+git clone https://github.com/loveyana/corplink-rs --depth 1
 cd corplink-rs
 # build libwg
 cd libwg
@@ -73,11 +95,70 @@ systemctl enable corplink-rs.service
 systemctl start corplink-rs@test.service
 ```
 
+
+## macOS GUI（CorplinkGUI）
+
+<p align="center">
+  <img src="docs/images/gui-window.png" alt="CorpLink RS GUI" width="420" />
+</p>
+
+原生 SwiftUI 菜单栏应用，封装 `corplink-rs`：
+
+| 能力 | 说明 |
+|------|------|
+| 连接 / 断开 | 管理员权限拉起 / 停止 VPN |
+| 模式 | 极速（split）/ 全局（full）；已连接时需 **Apply 重连** |
+| 节点 | 自动 / 延迟最低 / 指定节点；已连接时需 **Apply 重连** |
+| 延迟 | `Ping` 探测全部节点 RTT，展示在节点名旁 |
+| OTP | 实时 6 位码、倒计时、显示/隐藏、复制 |
+| 全局快捷键 | 默认 `⌃⌘O` 复制 OTP；冲突时提示并允许更换 |
+| SSO | 分步确认：Open Login → Confirm Auth Done |
+| 菜单栏 | 状态、OTP、模式/节点、快捷键、打开主窗口 |
+
+```bash
+cargo build --release
+cd gui && ./build.sh
+open CorplinkGUI.app
+```
+
+更多细节见 [`gui/README.md`](gui/README.md)。
+
+## 飞连 OTP（`corplink-otp`）
+
+独立 CLI：从 macOS Keychain 读取 TOTP secret。GUI 也通过它刷新验证码。
+
+```bash
+./corplink-otp/scripts/install.sh
+corplink-otp import path/to/otp_secret.json   # one-time
+corplink-otp                                  # print code
+corplink-otp --json                           # {"code":"123456","expires_in":18}
+corplink-rs otp fetch config/config.json      # export secret after login
+```
+
+全局快捷键配置写在 `config/gui_settings.json`：
+
+```json
+{
+  "otp_global_hotkey": "ctrl+cmd+o"
+}
+```
+
+可选：`off` / `ctrl+cmd+o` / `ctrl+cmd+c` / `option+cmd+o` / `ctrl+option+cmd+o`。  
+若快捷键已被占用，GUI **不会启用**，并提示在菜单栏 **OTP Hotkey** 中更换。
+
+## 节点延迟探测
+
+```bash
+# JSON to stdout; also writes config/vpn_latency_cache.json
+corplink-rs nodes config/config.json
+corplink-rs nodes --login config/config.json
+```
+
 ## windows 使用说明
 
 ### 快速开始（推荐使用预编译版本）
 
-1. 从 [Releases](https://github.com/PinkD/corplink-rs/releases) 下载 `corplink-rs-*-windows.zip`
+1. 从 [Releases](https://github.com/loveyana/corplink-rs/releases) 下载 `corplink-rs-*-windows.zip`
 2. 解压到任意目录
 3. 运行 `setup.ps1` 自动获取 `wintun.dll`：
 
@@ -121,6 +202,8 @@ $env:RUST_LOG="debug"; .\corplink-rs.exe config.json
 
 macos 要求 tun 设备的名称满足正则表达式 `utun[0-9]*` ，因此需要将配置文件中的 `interface_name` 改为符合正则的名字，例如 `utun12345`  
 另外， `utun` 后的数字类型应该是 `int16` ，如果大于 `32767` 会报错 `Failed to create TUN device: invalid argument` 。具体参考 [#46](https://github.com/PinkD/corplink-rs/issues/46)
+
+推荐直接使用 Release 中的 `CorplinkGUI.app`（见上方 **macOS GUI**）。
 
 ## log level 配置
 
@@ -315,7 +398,7 @@ graph TD;
 
 # TODO
 
-- [ ] 使用 [Tauri][7] 实现界面(~~或许大概可能永远不会有~~)
+- [x] macOS 原生 GUI（CorplinkGUI，SwiftUI；非 Tauri）
   - 参考实现：https://github.com/huangzheng2016/ecorplink
 - [x] 实现 TCP 版的 wg 协议
 - [x] 为不同配置生成不同的 `cookies.json`
@@ -326,6 +409,14 @@ graph TD;
 
 # Changelog
 
+- 0.5.7
+  - macOS CorplinkGUI: global OTP hotkey with conflict detection (`config/gui_settings.json`)
+  - docs: GUI/OTP screenshots and usage in README
+- 0.5.6
+  - macOS CorplinkGUI (menu bar + window, SSO steps, live OTP, latency probe)
+  - `corplink-rs nodes` latency probe + per-node RTT in GUI
+  - request signature fix (upstream PR #99)
+  - Keychain-backed `corplink-otp`
 - 0.5.5
   - add more route configs(@yanickxia @zier-one @kfxhjz @ZeppLu)
   - support protocol override config(@n-WN)
