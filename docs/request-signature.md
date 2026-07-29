@@ -163,6 +163,46 @@ CorpLink/{CORPLINK_APP_VERSION} (linux; Linux; en)
 
 ---
 
+## Signature generation flowchart
+
+How `sign_request` builds the `sign` header (no commas in labels — GitHub Mermaid is picky):
+
+```mermaid
+flowchart TD
+    A[API call ListVPN or ConnectVPN] --> B{Needs sign?}
+    B -->|other APIs| Z[Skip signing]
+    B -->|ListVPN 510 or ConnectVPN 542| C{device_id present?}
+    C -->|no| E1[Error: missing device_id]
+    C -->|yes| D[info = company_name + device_id]
+    D --> F[key = HKDF-SHA256 from SIGN_SECRET]
+    F --> G[Collect fields 1..9]
+    G --> H[method path query body-hash Cookie empty csrf empty vpn-token]
+    H --> I{For each bit i in 1..9}
+    I -->|bit set in params| J[Append field bytes to canonical]
+    I -->|bit clear| K[Skip field]
+    J --> L
+    K --> L
+    L{More bits?} -->|yes| I
+    L -->|no| M[HMAC-SHA256 key over canonical]
+    M --> N[Protobuf version + params + hmac]
+    N --> O[sign = v1; Base64 protobuf]
+    O --> P[Attach HTTP header and send request]
+```
+
+Bitmap branch (what gets into `canonical`):
+
+```mermaid
+flowchart LR
+    subgraph listvpn [ListVPN params=510]
+        L1[method path query body-hash Cookie empty csrf empty]
+    end
+    subgraph connectvpn [ConnectVPN params=542]
+        C1[method path query body-hash Cookie vpn-token]
+    end
+```
+
+---
+
 ## End-to-end flow
 
 ```mermaid
@@ -188,7 +228,6 @@ sequenceDiagram
     C->>S: POST /vpn/conn + Cookie + csrf + sign + body
     S-->>C: WireGuard peer config
 ```
-
 ---
 
 ## Failure modes
