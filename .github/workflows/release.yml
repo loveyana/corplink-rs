@@ -52,7 +52,7 @@ jobs:
       - name: create tarball
         run: |
           cp pack/pkg/corplink-rs/usr/bin/corplink-rs .
-          cp config/config.json .
+          cp config.example.json config.json
           tar -czf corplink-rs-${{ github.ref_name }}-linux-$(uname -m).tar.gz corplink-rs config.json
       - name: upload tarball to artifact
         uses: actions/upload-artifact@v6
@@ -84,23 +84,30 @@ jobs:
         run: cd libwg && ./build.sh
       - name: build package
         run: cargo build --release
+      - name: build GUI
+        run: |
+          chmod +x gui/build.sh gui/scripts/*.sh
+          ./gui/build.sh
       - name: build tarball
         run: |
-          cd target
-          cp release/corplink-rs .
-          cp ../config/config.json .
-          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+          STAGE="corplink-rs-${{ github.ref_name }}-macos-$(uname -m)"
+          mkdir -p "$STAGE"
+          cp target/release/corplink-rs "$STAGE/"
+          cp -R gui/CorplinkGUI.app "$STAGE/"
+          cp config.example.json "$STAGE/config.json"
+          cp gui/README.md "$STAGE/GUI-README.md"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
         with:
           name: macos-tarball
-          path: target/corplink-rs-*.tar.gz
+          path: corplink-rs-${{ github.ref_name }}-macos-*.tar.gz
       - name: upload package to release
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/corplink-rs-*.tar.gz
+          file: corplink-rs-${{ github.ref_name }}-macos-*.tar.gz
           tag: ${{ github.ref }}
           overwrite: true
           file_glob: true
@@ -127,7 +134,7 @@ jobs:
       - name: build check result
         run: |
           Move-Item -Path "target/release/corplink-rs.exe" -Destination "."
-          Move-Item -Path "config/config.json" -Destination "."
+          Copy-Item -Path "config.example.json" -Destination "config.json"
           Copy-Item -Path "scripts/setup.ps1" -Destination "."
           Compress-Archive -Path corplink-rs.exe,config.json,setup.ps1 -Destination corplink-rs-${{ github.ref_name }}-windows.zip
       - name: upload package to artifact
